@@ -1,18 +1,21 @@
 # UKMO NWP Globe
 
 A 3D globe for Met Office model output, for the larger-domain models
-where a flat map distorts. Prototype: rainfall from UKV (on top) and the
-Global 10 km model, with MSLP isobars from both, on one globe you can spin
-and zoom. It does not replace the flat viewer in the UKMO NWP tools.
+where a flat map distorts. Rainfall, MSLP and wind from UKV and the
+Global 10 km model on one globe you can spin and zoom, with a layer
+panel and time controls like the UKMO NWP viewer. It does not replace
+the flat viewer in the UKMO NWP tools.
 
-![North Atlantic](docs/screenshots/globe_atlantic.png)
+![Window](docs/screenshots/globe_window.png)
 
 ## Principle
 
 Each model is drawn on its own native cells, built from the cell bounds
 in its NetCDF files (UKV's Lambert equal-area grid is converted to
-longitude/latitude with pyproj). Nothing is resampled; the value on a
-cell is the value in the file. Dry cells (< 0.1 mm) are see-through.
+longitude/latitude with pyproj). Nothing is resampled; a cell's colour
+comes from the value in the file. Isobars are contoured on each model's
+own grid. Wind barbs are drawn at every 24th UKV cell centre (about
+48 km apart) with that cell's own speed and direction.
 
 ## Install and run
 
@@ -21,20 +24,42 @@ conda env create -f environment.yml
 conda run -n ukmo_globe python globe.py
 ```
 
-Opens on Ireland. Drag to turn the globe (north stays up), scroll to
-zoom, Shift+drag to pan.
+## The window
+
+**Layers panel** (right): tick a layer on or off; the slider sets its
+opacity; each layer shows its colour key.
+
+| Layer | From | Colours / style | Default |
+|---|---|---|---|
+| UKV wind barbs | UKV 10 m speed and direction | Knots: half 5, full 10, pennant 50 | off |
+| UKV MSLP | UKV | Blue isobars, every 4 hPa | on |
+| Global MSLP | Global | Black isobars, every 4 hPa | on |
+| UKV rain | UKV hourly | Radar-style, 0.1 to 16+ mm | on |
+| UKV gust | UKV 10 m gust | Gust warning bands, as the viewer (km/h) | off, 76 % |
+| UKV wind speed | UKV 10 m mean | Viewer wind bands (km/h) | off, 76 % |
+| Global rain | Global hourly | Radar-style, 0.1 to 16+ mm | on |
+
+Wind is UKV only: the archive holds no Global wind (the products
+pipeline downloads only Global rain and MSLP).
+
+**Time bar** (bottom): first, back, play/pause, forward, last; the time
+slider; play speed (0.5 to 4 hours a second); the valid time and each
+model's lead; Home view; North up; how many hours are ready. Play waits
+for an hour that is not ready yet and stops at the last hour.
+
+**Mouse**: drag to turn the globe (north stays up), scroll to zoom,
+Shift+drag to pan.
 
 | Key | Action |
 |---|---|
 | Right / Left | Next / previous hour |
-| Up / Down (or Page Up / Page Down) | Six hours on / back |
-| h | Home: the Ireland view, north up |
+| Up / Down, Page Up / Page Down | Six hours on / back |
+| Home / End | First / last hour |
+| Space | Play / pause |
+| h | Home view: Ireland, north up |
 | n | North up from the current view |
-| q | Quit |
 
-Buttons at the top left switch each layer on and off: Global rain, UKV
-rain, Global MSLP (black isobars) and UKV MSLP (blue isobars, UKV area
-only).
+## Options
 
 | Option | Meaning |
 |---|---|
@@ -42,34 +67,26 @@ only).
 | `--ukv-run`, `--global-run` | Runs to show, e.g. `20261115T2100Z` (default: newest in the archive) |
 | `--valid TIME` | Starting valid time, e.g. `20261116T0300Z` (default: first hour both models cover) |
 | `--base grey` / `colour` | Background: Natural Earth I shaded relief in grey (default) or in colour |
-| `--area atlantic` / `world` | Global area drawn (default `atlantic`) |
+| `--area atlantic` / `world` | Global area drawn (default `atlantic`: 80°W-50°E, 15-80°N) |
 | `--view ireland` / `atlantic` | Starting view |
-| `--hide LAYER ...` | Layers to start switched off, e.g. `--hide "Global MSLP"` |
-| `--screenshot FILE` | Write a PNG and exit (`--steps N` steps N hours first) |
 
-Times step through the Global run's hours; UKV is shown for the hours
-its run covers.
+For testing: `--screenshot FILE` draws the globe off screen and writes
+a PNG (with `--show LAYER ...`, `--hide LAYER ...`, `--steps N`);
+`--smoke FILE` opens the window, saves a picture of it and closes.
 
-Global is drawn for the North Atlantic and Europe (80°W-50°E,
-15-80°N) by default, a block of its native cells; `--area world` draws
-it all.
+## Speed
 
 Once the window is open, two background workers prepare every hour,
 nearest hours first, and save them in `cache\` (newest 6 runs kept), so
-reopening a run is quick. Measured on a 54-hour run:
+reopening a run is quick and stepping is near-instant. The grey
+background is made once and saved there too.
 
-| | `atlantic` | `world` |
-|---|---|---|
-| All hours ready, first opening | 16 s | 37 s |
-| All hours ready, reopening | 0.3 s | 0.6 s |
-| One step | 0.02 s | 0.06 s |
-| Memory for all hours | 0.13 GB | 0.58 GB |
-| Disk cache per run | 134 MB | 582 MB |
+## Files
 
-The grey background is made once and saved in `cache\`. Isobars are
-every 4 hPa, contoured on each model's own grid and labelled about every
-750 km. UKV MSLP over high ground shows small closed loops, as in the
-model field.
+| File | What it holds |
+|---|---|
+| `globe_core.py` | Data, layers, drawing and background preparation; no window code |
+| `globe.py` | The Qt window (layer panel, time bar, keys) and the command line |
 
 The archive layout is `<archive>/<model>/<run>/<parameter>/*.nc`, as
 written by the UKMO NWP tools.
@@ -80,5 +97,8 @@ written by the UKMO NWP tools.
   `%LOCALAPPDATA%\geovista`; offline use needs these bundled.
 - Needs working OpenGL; untested on remote desktops and virtual
   machines.
-- Not yet: hover values, colour bar, time slider, wind, MOGREPS, other
-  models (ICON, HARMONIE).
+- Barbs are a fixed spacing; they do not thin or thicken with zoom.
+- UKV MSLP over high ground shows small closed loops, as in the model
+  field.
+- Not yet: hover values, Global wind, MOGREPS, other models (ICON,
+  HARMONIE).
