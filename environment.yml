@@ -10,3 +10,4 @@ dependencies:
   - xarray
   - pyproj
   - pyflakes
+  - scipy

@@ -4,9 +4,15 @@ Each model is drawn on its own native cells: every cell is a quad built
 from the file's cell bounds (UKV in its Lambert equal-area metres
 turned into longitude/latitude by pyproj, Global straight from its
 latitude/longitude bounds). Nothing is resampled; the colour of a cell
-comes from the value in the file. Isobars are contoured on each model's
-own grid; wind barbs are drawn at a subset of UKV cell centres with
+comes from the value in the file (or a sum of the model's own files for
+rainfall windows). Isobars and high/low centres are found on each
+model's own grid; wind barbs are drawn at a subset of cell centres with
 those cells' own speed and direction.
+
+Every layer exists once per model ("ukv:rain_6h", "global:rain_6h"),
+with the UKMO NWP viewer's bands, colours and default opacity. Layers
+are prepared only while switched on, in background threads, nearest
+hours first; Global files that are not on disk are downloaded then.
 
 ``Scene`` works with any GeoVista plotter: the Qt window in ``globe.py``
 or an off-screen plotter for screenshots.
@@ -14,12 +20,12 @@ or an off-screen plotter for screenshots.
 
 from __future__ import annotations
 
-import glob
 import os
 import shutil
 import threading
+import time as _time
 import warnings
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import contourpy
 import geovista as gv
@@ -28,61 +34,87 @@ import pyvista as pv
 import xarray as xr
 from pyproj import CRS, Transformer
 
+import globe_data as data
+from globe_pressure import find_pressure_centres
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Default: the UKMO NWP tools' archive next to this project.
 ARCHIVE = os.path.normpath(os.path.join(HERE, "..", "ukmo_nwp", "data",
                                         "archive"))
 CACHE = os.path.join(HERE, "cache")
-CACHE_VERSION = 3                   # bump when prepared data changes
+CACHE_VERSION = 6                   # bump when prepared data changes
 KEEP_CACHED_RUNS = 6
 
-RAIN = ("precipitation_accumulation", "lwe_thickness_of_precipitation_amount")
-MSLP = ("pressure_at_mean_sea_level", "air_pressure_at_sea_level")
-WIND = ("wind_speed_at_10m", "wind_speed")
-WDIR = ("wind_direction_at_10m", "wind_from_direction")
-GUST = ("wind_gust_at_10m", "wind_speed_of_gust")
-
-RAIN_BOUNDS = [0.1, 0.5, 1, 2, 4, 8, 16, np.inf]
-RAIN_COLOURS = ["#9be564", "#2fb344", "#fde725", "#fd9a2a", "#e8322a",
-                "#c51b8a", "#7a0177"]
-# Wind bands and colours as the UKMO NWP viewer's wind and gust layers
-# (km/h; the gust bands are the products' gust warning bands).
-WIND_COLOURS = ["#FFFFFF", "#BFEFFF", "#73D0FF", "#FFF200", "#FFA500",
-                "#EE1111", "#8B0015"]
-WIND_BOUNDS = [0, 20, 40, 55, 65, 80, 100, 130]
-GUST_BOUNDS = [0, 30, 60, 90, 110, 130, 160, 200]
+RAIN = "precipitation_accumulation"
+MSLP = "pressure_at_mean_sea_level"
+WIND = "wind_speed_at_10m"
+WDIR = "wind_direction_at_10m"
 ISOBARS = np.arange(940, 1061, 4)
+MS_TO_KMH = 3.6
+MS_TO_KT = 1.943844
 
-# Every layer, bottom to top. "z" lifts a layer off the globe so the
-# order holds; "model" says which run it comes from.
-LAYERS = {
-    "Global rain": dict(kind="raster", model="global", source=RAIN,
-                        scale=1000.0, bounds=RAIN_BOUNDS,
-                        colours=RAIN_COLOURS, clear_below=0.1,
-                        units="mm in the hour", z=2, visible=True,
-                        opacity=1.0),
-    "UKV wind speed": dict(kind="raster", model="ukv", source=WIND,
-                           scale=3.6, bounds=WIND_BOUNDS,
-                           colours=WIND_COLOURS, clear_below=None,
-                           units="km/h, 10 m mean", z=3, visible=False,
-                           opacity=0.76),
-    "UKV gust": dict(kind="raster", model="ukv", source=GUST, scale=3.6,
-                     bounds=GUST_BOUNDS, colours=WIND_COLOURS,
-                     clear_below=None, units="km/h, 10 m gust", z=3.5,
-                     visible=False, opacity=0.76),
-    "UKV rain": dict(kind="raster", model="ukv", source=RAIN, scale=1000.0,
-                     bounds=RAIN_BOUNDS, colours=RAIN_COLOURS,
-                     clear_below=0.1, units="mm in the hour", z=4,
-                     visible=True, opacity=1.0),
-    "Global MSLP": dict(kind="isobars", model="global", colour="#1a1a1a",
-                        z=6, visible=True, opacity=1.0),
-    "UKV MSLP": dict(kind="isobars", model="ukv", colour="#1f4fbf", z=7,
-                     visible=True, opacity=1.0),
-    "UKV wind barbs": dict(kind="barbs", model="ukv", colour="#202020",
-                           z=9, visible=False, opacity=1.0),
+_RAIN_A = ["#BFEFFF", "#3FA7FF", "#244BFF", "#28D978", "#00A930", "#FFF200",
+           "#FF9900", "#E51C23"]
+_WIND = ["#FFFFFF", "#BFEFFF", "#73D0FF", "#FFF200", "#FFA500", "#EE1111",
+         "#8B0015"]
+# The viewer's layers (ukmo_nwp config.yaml forecast_layers), bottom to
+# top as its zorder. "levels" has one more value than "colours".
+STYLES = {
+    "rain_1h": dict(name="1-hour rainfall", kind="raster", hours=1,
+                    units="mm", levels=[0.2, 0.5, 1, 2, 4, 8, 16, 32, 64],
+                    colours=_RAIN_A, clear_below=0.2, opacity=0.88),
+    "rain_3h": dict(name="3-hour rainfall", kind="raster", hours=3,
+                    units="mm", levels=[0.5, 1, 2, 4, 8, 12, 16, 24, 40],
+                    colours=_RAIN_A, clear_below=0.5, opacity=0.88),
+    "rain_6h": dict(name="6-hour rainfall", kind="raster", hours=6,
+                    units="mm", levels=[1, 2, 4, 8, 12, 16, 24, 32, 50],
+                    colours=["#2B55FF", "#4BEB84", "#00C900", "#EFFE00",
+                             "#FFFF8B", "#B44BC4", "#FF33FE", "#FF0000"],
+                    clear_below=1, opacity=0.88, visible=True),
+    "rain_run": dict(name="Run-total rainfall", kind="raster", hours="run",
+                     units="mm", levels=[1, 5, 10, 20, 40, 60, 80, 120, 180],
+                     colours=["#dce3e7", "#a3c9e5", "#4696cc", "#0096a1",
+                              "#99d5ce", "#619b3d", "#ecac62", "#da5863"],
+                     clear_below=1, opacity=0.88),
+    "rain_24h": dict(name="24-hour rainfall", kind="raster", hours=24,
+                     units="mm", levels=[1, 5, 10, 20, 30, 40, 50, 80, 120],
+                     colours=["#BFEFFF", "#5AC8FA", "#2878FF", "#33CC66",
+                              "#FFF200", "#FFAA00", "#FF4B2B", "#B00020"],
+                     clear_below=1, opacity=0.88),
+    "cape": dict(name="Most-unstable CAPE", kind="raster",
+                 param="CAPE_most_unstable_below_500hPa", units="J/kg",
+                 levels=[50, 300, 600, 900, 1200, 1500, 1800, 2100, 2400,
+                         3000],
+                 colours=["#565175", "#020183", "#0002FD", "#00A3FF",
+                          "#00FCEA", "#0DAA52", "#02FC02", "#E4FF00",
+                          "#EB0000"], clear_below=50, opacity=0.82),
+    "temperature": dict(name="Screen temperature", kind="raster",
+                        param="temperature_at_screen_level", offset=-273.15,
+                        units="°C",
+                        levels=[-15, -10, -5, 0, 5, 10, 15, 20, 25, 30, 35],
+                        colours=["#4A148C", "#3949AB", "#2196F3", "#80DEEA",
+                                 "#DCE775", "#66BB6A", "#FFEB3B", "#FF9800",
+                                 "#F44336", "#880E4F"], opacity=0.82),
+    "wind_speed": dict(name="10 m wind speed", kind="raster", param=WIND,
+                       scale=MS_TO_KMH, units="km/h",
+                       levels=[0, 20, 40, 55, 65, 80, 100, 130],
+                       colours=_WIND, opacity=0.76),
+    "gust": dict(name="10 m wind gust", kind="raster",
+                 param="wind_gust_at_10m", scale=MS_TO_KMH, units="km/h",
+                 levels=[0, 30, 60, 90, 110, 130, 160, 200], colours=_WIND,
+                 opacity=0.76),
+    "mslp": dict(name="MSLP contours", kind="isobars", colour="#1a1a1a",
+                 units="hPa", visible=True),
+    "barbs": dict(name="10 m wind barbs", kind="barbs", colour="#202020",
+                  units="knots"),
+    "centres": dict(name="High / low centres", kind="centres",
+                    units="hPa", visible=True),
 }
-BARB_STRIDE = 24                    # every 24th UKV cell, about 48 km
-BARB_LENGTH = 0.0055                # globe radii, about 35 km
+RASTERS = [k for k, s in STYLES.items() if s["kind"] == "raster"]
+CENTRE_COLOURS = {"H": "#1f4fbf", "L": "#d01c1c"}
+BARB_STRIDE = {"ukv": 24}      # UKV cells: about 48 km
+BARB_KM = 48.0                 # Global barb spacing
+BARB_LENGTH = 0.0055                           # globe radii, about 35 km
 
 HOME = (-8.0, 53.4, 7.0)            # lon, lat, zoom
 ATLANTIC = (-15.0, 52.0, 2.4)
@@ -96,47 +128,35 @@ warnings.filterwarnings("ignore", message="geovista found no coordinate")
 # NetCDF/HDF5 reading is not safe from two threads at once.
 READ_LOCK = threading.Lock()
 CLEAR = 255                         # class code: see-through
+PENDING = object()                  # cache marker: not prepared yet
 
 
-def stamp(text):
-    return datetime.strptime(text, "%Y%m%dT%H%MZ")
+def layer_id(model, style):
+    return f"{model}:{style}"
+
+
+def split_id(lid):
+    model, style = lid.split(":")
+    return model, style
 
 
 def lead_hours(t, run):
-    return int((t - stamp(run)) / timedelta(hours=1))
+    return int((t - data.stamp(run)) / timedelta(hours=1))
 
 
-def _index(model, run, param):
-    """{valid time: file} for one run and parameter. The valid time is
-    the first part of each file name."""
-    out = {}
-    for path in glob.glob(os.path.join(ARCHIVE, model, run, param, "*.nc")):
-        out[stamp(os.path.basename(path).split("-")[0])] = path
-    return out
-
-
-def latest_run(model):
-    try:
-        runs = sorted(os.listdir(os.path.join(ARCHIVE, model)))
-    except OSError:
-        runs = []
-    if not runs:
-        raise SystemExit(f"No {model} runs in {ARCHIVE}")
-    return runs[-1]
-
-
-def _values(path, name, scale):
-    """Raw values from one file (scaled to mm, km/h or hPa only)."""
+def read_field(path, scale=1.0, offset=0.0):
+    """The one 2D field in a file, scaled (to mm, km/h, °C, hPa) only."""
     with READ_LOCK, xr.open_dataset(path) as ds:
-        return ds[name].values * scale
+        var = next(ds[k] for k in ds.data_vars if ds[k].ndim >= 2)
+        return (var.values.astype(np.float32) * scale + offset)
 
 
-def classes(values, bounds, clear_below=None):
-    """Values -> colour class as bytes; missing values, and values below
-    ``clear_below``, become CLEAR (see-through). Stored small so every
-    hour can be kept in memory."""
-    n = len(bounds) - 1
-    out = np.clip(np.digitize(values, bounds[1:-1]), 0, n - 1)
+def classes(values, levels, clear_below=None):
+    """Values -> colour class as bytes (values beyond the ends take the
+    end colours); missing values, and values below ``clear_below``,
+    become CLEAR (see-through)."""
+    n = len(levels) - 1
+    out = np.clip(np.digitize(values, levels[1:-1]), 0, n - 1)
     out = out.astype(np.uint8)
     clear = ~np.isfinite(values)
     if clear_below is not None:
@@ -207,7 +227,7 @@ def isobar_labels(isobars, spacing=0.12):
     kept = order[first]
     # Boxes in a chequerboard only, so neighbours' labels do not touch.
     kept = kept[np.sum(box[kept], axis=1) % 2 == 0]
-    return pts[kept] * 1.004, [f"{hpa[i]:.0f}" for i in kept]
+    return pts[kept] * 1.006, [f"{hpa[i]:.0f}" for i in kept]
 
 
 def _groups(counts):
@@ -267,22 +287,24 @@ def barb_mesh(lon, lat, knots, from_deg, length=BARB_LENGTH):
 class UkvGrid:
     """The UKV grid: cell edges and centres, and its projection."""
 
+    world = False
+
     def __init__(self, path):
         with xr.open_dataset(path) as ds:
-            var = next(ds[k] for k in ds.data_vars if ds[k].ndim == 2)
-            crs = CRS.from_cf(ds[var.attrs["grid_mapping"]].attrs)
+            var = next(ds[k] for k in ds.data_vars if ds[k].ndim >= 2)
+            self.crs = CRS.from_cf(ds[var.attrs["grid_mapping"]].attrs)
             xb = ds["projection_x_coordinate_bnds"].values
             yb = ds["projection_y_coordinate_bnds"].values
             self.x = ds["projection_x_coordinate"].values
             self.y = ds["projection_y_coordinate"].values
-        self.transform = Transformer.from_crs(crs, "EPSG:4326",
+        self.transform = Transformer.from_crs(self.crs, "EPSG:4326",
                                               always_xy=True).transform
         self.x_edges = np.append(xb[:, 0], xb[-1, 1])
         self.y_edges = np.append(yb[:, 0], yb[-1, 1])
-        # Barb positions: a regular subset of cell centres.
-        self.barb_rows = slice(BARB_STRIDE // 2, None, BARB_STRIDE)
-        self.barb_cols = slice(BARB_STRIDE // 2, None, BARB_STRIDE)
-        bx, by = np.meshgrid(self.x[self.barb_cols], self.y[self.barb_rows])
+        s = BARB_STRIDE["ukv"]
+        self.barb_cut = (slice(s // 2, None, s), slice(s // 2, None, s))
+        bx, by = np.meshgrid(self.x[self.barb_cut[1]],
+                             self.y[self.barb_cut[0]])
         self.barb_lon, self.barb_lat = self.transform(bx.ravel(), by.ravel())
         self._mesh = None
 
@@ -298,12 +320,15 @@ class UkvGrid:
     def cut(self, values):
         return values
 
-    def barbs(self, values):
-        return values[self.barb_rows, self.barb_cols].ravel()
+    def lonlat(self, x, y):
+        return self.transform(np.asarray(x), np.asarray(y))
 
 
 class GlobalGrid:
     """The rows and columns of the Global grid inside the chosen area."""
+
+    transform = None
+    crs = "EPSG:4326"
 
     def __init__(self, path, area):
         with xr.open_dataset(path) as ds:
@@ -326,10 +351,26 @@ class GlobalGrid:
         lb, tb = lonb[self.cols], latb[self.rows]
         self.lon_edges = np.append(lb[:, 0], lb[-1, 1])
         self.lat_edges = np.append(tb[:, 0], tb[-1, 1])
-        self.transform = None
+        # Barbs about BARB_KM apart everywhere: columns get narrower
+        # towards the poles, so each row takes a wider column step.
+        dy = abs(self.y[1] - self.y[0]) * 111.2
+        dx = abs(self.x[1] - self.x[0]) * 111.2
+        rows, cols = [], []
+        for j in range(0, self.y.size, max(1, round(BARB_KM / dy))):
+            step = max(1, round(BARB_KM / max(
+                dx * np.cos(np.radians(self.y[j])), 1e-3)))
+            c = np.arange(step // 2, self.x.size, step)
+            rows.append(np.full(c.size, j))
+            cols.append(c)
+        self.barb_cut = (np.concatenate(rows), np.concatenate(cols))
+        self.barb_lon = self.x[self.barb_cut[1]]
+        self.barb_lat = self.y[self.barb_cut[0]]
 
     def cut(self, values):
         return values[self.rows, self.cols]
+
+    def lonlat(self, x, y):
+        return np.asarray(x), np.asarray(y)
 
     def mesh(self):
         shape = (self.y.size, self.x.size)
@@ -355,58 +396,40 @@ def grey_texture():
     return pv.Texture(image)
 
 
-# ---- prepared hours on disk -------------------------------------------
+# ---- prepared items on disk ---------------------------------------------
 
-def _key(name):
-    return name.replace(" ", "_")
-
-
-def _save_hour(path, ready):
-    out = {}
-    for name, value in ready.items():
-        k = _key(name)
-        if value is None:
-            continue
-        if LAYERS[name]["kind"] == "raster":
-            out[f"r_{k}"] = value
-            continue
+def _save_item(path, value):
+    if isinstance(value, np.ndarray):
+        out = {"raster": value}
+    else:
         mesh, (pts, txt) = value
-        out[f"p_{k}"] = np.asarray(mesh.points, dtype=np.float32)
-        out[f"l_{k}"] = np.asarray(mesh.lines, dtype=np.int32)
-        out[f"v_{k}"] = np.asarray(mesh.point_data.get("hPa", []),
-                                   dtype=np.float32)
-        out[f"lp_{k}"] = (np.zeros((0, 3), np.float32) if pts is None
-                          else pts.astype(np.float32))
-        out[f"lt_{k}"] = np.array(txt, dtype="U8")
+        out = {"points": np.asarray(mesh.points, dtype=np.float32),
+               "lines": np.asarray(mesh.lines, dtype=np.int32),
+               "hpa": np.asarray(mesh.point_data.get("hPa", []),
+                                 dtype=np.float32),
+               "label_pts": (np.zeros((0, 3), np.float32) if pts is None
+                             else np.asarray(pts, np.float32)),
+               "label_txt": np.array(txt, dtype="U16")}
     tmp = path + ".part.npz"
     np.savez(tmp, **out)
     os.replace(tmp, path)
 
 
-def _load_hour(path):
-    ready = {}
+def _load_item(path):
     with np.load(path) as f:
-        for name, spec in LAYERS.items():
-            k = _key(name)
-            if spec["kind"] == "raster":
-                ready[name] = f[f"r_{k}"] if f"r_{k}" in f else None
-                continue
-            if f"p_{k}" not in f:
-                ready[name] = None
-                continue
-            mesh = pv.PolyData()
-            if f[f"p_{k}"].size:
-                mesh = pv.PolyData(f[f"p_{k}"], lines=f[f"l_{k}"])
-                if f[f"v_{k}"].size:
-                    mesh.point_data["hPa"] = f[f"v_{k}"]
-            pts = f[f"lp_{k}"]
-            ready[name] = (mesh, (pts if len(pts) else None,
-                                  list(f[f"lt_{k}"])))
-    return ready
+        if "raster" in f:
+            return f["raster"]
+        mesh = pv.PolyData()
+        if f["points"].size:
+            mesh = pv.PolyData(f["points"], lines=f["lines"])
+            if f["hpa"].size:
+                mesh.point_data["hPa"] = f["hpa"]
+        pts = f["label_pts"]
+        return mesh, (pts if len(pts) else None, list(f["label_txt"]))
 
 
 def _prune_cache():
-    """Keep the newest few runs' prepared hours."""
+    """Keep the newest few runs' prepared items."""
     try:
         runs = [d for d in os.scandir(CACHE) if d.is_dir()]
     except OSError:
@@ -416,56 +439,71 @@ def _prune_cache():
         shutil.rmtree(d.path, ignore_errors=True)
 
 
+def _set_opacity(actor, value):
+    """Opacity for a mesh actor or a label actor."""
+    try:
+        actor.GetProperty().SetOpacity(float(value))
+    except AttributeError:
+        try:
+            actor.GetMapper().GetLabelTextProperty().SetOpacity(float(value))
+        except AttributeError:
+            pass
+
+
 class Scene:
-    """All layers on one GeoVista plotter, stepped through valid times."""
+    """All layers of both models on one GeoVista plotter."""
 
     def __init__(self, pl, ukv_run=None, global_run=None, valid=None,
-                 area="atlantic", base="grey", view="ireland"):
+                 area="atlantic", base="grey", view="ireland",
+                 archive=None):
         self.pl = pl
-        self.ukv_run = ukv_run or latest_run("ukv")
-        self.glo_run = global_run or latest_run("global10km")
-        self.files = {}
-        for name, spec in LAYERS.items():
-            run = self.ukv_run if spec["model"] == "ukv" else self.glo_run
-            model = "ukv" if spec["model"] == "ukv" else "global10km"
-            if spec["kind"] == "raster":
-                self.files[name] = {"v": _index(model, run, spec["source"][0])}
-            elif spec["kind"] == "isobars":
-                self.files[name] = {"v": _index(model, run, MSLP[0])}
-            else:
-                self.files[name] = {"v": _index(model, run, WIND[0]),
-                                    "d": _index(model, run, WDIR[0])}
-        glo = self.files["Global rain"]["v"]
-        self.times = sorted(set(glo) & set(self.files["Global MSLP"]["v"]))
-        if not self.times:
-            raise SystemExit(f"No Global rain/MSLP in {self.glo_run}")
-        ukv_rain = self.files["UKV rain"]["v"]
+        archive = archive or ARCHIVE
+        self.runs = {"ukv": ukv_run or data.latest_run("ukv", archive),
+                     "global": global_run or data.latest_run("global",
+                                                             archive)}
+        data.prune_downloads(keep_run=self.runs["global"])
+        self.files = {m: data.Files(m, r, archive)
+                      for m, r in self.runs.items()}
+        self.grids = {"ukv": self._ukv_grid(),
+                      "global": self._global_grid(area)}
+        self.models = [m for m in ("ukv", "global") if self.grids[m]]
+        self.order = list(self.models)          # top model first
+
+        # Time axis: every valid time either model has (or, for Global,
+        # publishes): hourly, then 3-hourly in the Global tail.
+        times = set()
+        for m in self.models:
+            for param in (MSLP, RAIN):
+                times |= {v for v, _ in self.files[m].expected(param)}
+        self.times = sorted(times)
         if valid:
-            start = stamp(valid)
+            start = data.stamp(valid)
+            if start not in self.times:
+                raise SystemExit(f"No data valid {valid}")
         else:
-            both = [t for t in self.times if t in ukv_rain]
+            ukv = {v for v, _ in self.files["ukv"].held(RAIN)}
+            both = [t for t in self.times if t in ukv
+                    and t > data.stamp(self.runs["global"])]
             start = both[0] if both else self.times[0]
-        if start not in self.times:
-            raise SystemExit(f"No Global data valid {valid}")
         self.i = self.times.index(start)
 
-        any_ukv = next((f for n, s in LAYERS.items() if s["model"] == "ukv"
-                        for f in self.files[n]["v"].values()), None)
-        self.grids = {"global": GlobalGrid(glo[self.times[0]], AREAS[area]),
-                      "ukv": UkvGrid(any_ukv) if any_ukv else None}
-        self.area = area
-
-        self.visible = {n: s["visible"] for n, s in LAYERS.items()}
-        self.opacity = {n: s["opacity"] for n, s in LAYERS.items()}
-        self.actors = {n: [] for n in LAYERS}
-        # Every hour is prepared in the background, nearest to the
-        # shown hour first, so stepping only swaps in ready data.
-        # Prepared hours are also saved, so reopening a run is quick.
-        self.cache = {}
+        self.layers = [layer_id(m, s) for m in self.models for s in STYLES]
+        self.visible = {lid: STYLES[split_id(lid)[1]].get("visible", False)
+                        for lid in self.layers}
+        self.model_on = {m: True for m in self.models}
+        self.opacity = {lid: STYLES[split_id(lid)[1]].get("opacity", 1.0)
+                        for lid in self.layers}
+        self.rasters = {}                       # lid -> drawn mesh actor
+        self.lines = {lid: [] for lid in self.layers}
+        self.cache = {}                         # (lid, t) -> item or None
         self.claimed = set()
+        self.rain = {}                          # (model, end, period)
         self.lock = threading.Lock()
+        self.wake = threading.Event()
+        self.dirty = False
         self.disk = os.path.join(
-            CACHE, f"v{CACHE_VERSION}_{self.glo_run}_{self.ukv_run}_{area}")
+            CACHE, f"v{CACHE_VERSION}_{self.runs['global']}_"
+                   f"{self.runs['ukv']}_{area}")
         os.makedirs(self.disk, exist_ok=True)
         os.utime(self.disk)                     # newest for pruning
         _prune_cache()
@@ -485,23 +523,7 @@ class Scene:
         pl.set_background("#0b1020")
         texture = gv.natural_earth_1() if base == "colour" else grey_texture()
         pl.add_base_layer(texture=texture, zlevel=0)
-        # Raster layers keep one mesh each; a time step only changes the
-        # class values on it. Opacity is set on the actor afterwards:
-        # passing it to GeoVista's add_mesh starts a slow graphics-card
-        # check (about 1.4 s) every time.
-        for name, spec in LAYERS.items():
-            grid = self.grids[spec["model"]]
-            if spec["kind"] != "raster" or grid is None:
-                continue
-            n = len(spec["colours"])
-            actor = pl.add_mesh(grid.mesh(), zlevel=spec["z"],
-                                scalars="value", cmap=spec["colours"],
-                                clim=(-0.5, n - 0.5), n_colors=n,
-                                nan_opacity=0.0, show_scalar_bar=False)
-            _set_opacity(actor, spec["opacity"])
-            self.actors[name] = [actor]
-            actor.SetVisibility(self.visible[name])
-        pl.add_coastlines(color="black", line_width=1, zlevel=8)
+        pl.add_coastlines(color="black", line_width=1, zlevel=40)
 
         lon, lat, zoom = ATLANTIC if view == "atlantic" else HOME
         self.go_to(lon, lat, zoom)
@@ -509,7 +531,24 @@ class Scene:
         # Terrain style turns the globe about its axis and tilts it,
         # never rolls it: north stays up while dragging.
         pl.enable_terrain_style(mouse_wheel_zooms=True, shift_pans=True)
-        self.show()
+
+    def _ukv_grid(self):
+        for param in (RAIN, MSLP, WIND):
+            held = self.files["ukv"].held(param)
+            if held:
+                return UkvGrid(next(iter(held.values())))
+        return None
+
+    def _global_grid(self, area):
+        f = self.files["global"]
+        for param in (MSLP, RAIN):
+            held = f.held(param)
+            if held:
+                return GlobalGrid(next(iter(held.values())), AREAS[area])
+        path = f.path(MSLP, data.stamp(self.runs["global"]))
+        if path is None:
+            raise SystemExit(f"Global run {self.runs['global']} not found")
+        return GlobalGrid(path, AREAS[area])
 
     # ---- view ----
     def go_to(self, lon, lat, zoom):
@@ -529,162 +568,308 @@ class Scene:
             self.pl.render()
 
     # ---- layers ----
-    def available(self, name):
-        return (self.grids[LAYERS[name]["model"]] is not None
-                and bool(self.files[name]["v"]))
+    def is_on(self, lid):
+        return self.visible[lid] and self.model_on[split_id(lid)[0]]
 
-    def set_visible(self, name, on, render=True):
-        self.visible[name] = bool(on)
-        for actor in self.actors[name]:
-            actor.SetVisibility(bool(on))
-        if render:
-            self.pl.render()
+    def set_visible(self, lid, on, render=True):
+        self.visible[lid] = bool(on)
+        self.wake.set()
+        self.show(render=render)
 
-    def set_opacity(self, name, value, render=True):
-        self.opacity[name] = float(value)
-        for actor in self.actors[name]:
+    def set_model_on(self, model, on, render=True):
+        self.model_on[model] = bool(on)
+        self.wake.set()
+        self.show(render=render)
+
+    def set_opacity(self, lid, value, render=True):
+        self.opacity[lid] = float(value)
+        actors = self.lines[lid] + ([self.rasters[lid]]
+                                    if lid in self.rasters else [])
+        for actor in actors:
             _set_opacity(actor, value)
         if render:
             self.pl.render()
+
+    def _z(self, lid):
+        """Height of a layer: rasters of the upper model above those of
+        the lower one; lines above all rasters."""
+        # GeoVista heights are whole steps of 1/10000 of the radius
+        # (about 0.6 km); two steps apart keeps the depth order clear.
+        model, style = split_id(lid)
+        rank = len(self.order) - 1 - self.order.index(model)
+        if STYLES[style]["kind"] == "raster":
+            return 2 + 2 * (rank * len(RASTERS) + RASTERS.index(style))
+        return {"isobars": 44, "barbs": 48, "centres": 52}[
+            STYLES[style]["kind"]] + 2 * rank
+
+    def _add_raster(self, lid, mesh):
+        style = STYLES[split_id(lid)[1]]
+        n = len(style["colours"])
+        actor = self.pl.add_mesh(mesh, zlevel=self._z(lid), scalars="value",
+                                 cmap=style["colours"],
+                                 clim=(-0.5, n - 0.5), n_colors=n,
+                                 nan_opacity=0.0, show_scalar_bar=False)
+        _set_opacity(actor, self.opacity[lid])
+        self.rasters[lid] = actor
+        return actor
+
+    def set_order(self, order, render=True):
+        """Models top first; redraws the rasters at their new heights."""
+        self.order = [m for m in order if m in self.models]
+        for lid, actor in list(self.rasters.items()):
+            mesh = actor.mapper.dataset
+            visible = actor.GetVisibility()
+            self.pl.remove_actor(actor, render=False)
+            self._add_raster(lid, mesh).SetVisibility(visible)
+        self.show(render=render)
 
     # ---- time ----
     @property
     def time(self):
         return self.times[self.i]
 
-    def is_ready(self, i):
-        with self.lock:
-            return self.times[i] in self.cache
-
-    def n_ready(self):
-        with self.lock:
-            return len(self.cache)
-
     def go(self, i, render=True):
         self.i = int(np.clip(i, 0, len(self.times) - 1))
-        self.show()
-        if render:
-            self.pl.render()
+        self.wake.set()
+        self.show(render=render)
 
     def step(self, n, render=True):
         self.go(self.i + n, render)
 
-    def start_workers(self, n=2):
-        # File reading takes turns; the rest of the work overlaps.
+    def status(self):
+        """(ready, wanted, downloading) for switched-on layers."""
+        on = [lid for lid in self.layers if self.is_on(lid)]
+        with self.lock:
+            ready = sum((lid, t) in self.cache for lid in on
+                        for t in self.times)
+        downloading = sum(f.downloads for f in self.files.values())
+        return ready, len(on) * len(self.times), downloading
+
+    # ---- preparing ----
+    def start_workers(self, n=3):
+        # Three at once: downloads overlap; file reading takes turns.
         for _ in range(n):
-            threading.Thread(target=self._prepare_all, daemon=True).start()
+            threading.Thread(target=self._work, daemon=True).start()
 
-    def _prepare(self, t):
-        """Everything one hour needs on screen, from the raw values."""
-        saved = os.path.join(self.disk, f"{t:%Y%m%dT%H%MZ}.npz")
-        try:
-            ready = _load_hour(saved)
-        except (OSError, KeyError, ValueError):
-            ready = self._compute(t)
-            try:
-                _save_hour(saved, ready)
-            except OSError as exc:
-                print("Could not save", saved, exc)
+    def _next_job(self):
+        on = [lid for lid in self.layers if self.is_on(lid)]
+        best = None
         with self.lock:
-            self.cache[t] = ready
-        return ready
+            for k, t in enumerate(self.times):
+                for rank, lid in enumerate(on):
+                    key = (lid, t)
+                    if key in self.cache or key in self.claimed:
+                        continue
+                    score = (abs(k - self.i), k < self.i, rank)
+                    if best is None or score < best[0]:
+                        best = (score, key)
+            if best:
+                self.claimed.add(best[1])
+        return best[1] if best else None
 
-    def _compute(self, t):
-        ready = {}
-        for name, spec in LAYERS.items():
-            grid = self.grids[spec["model"]]
-            files = self.files[name]
-            if grid is None or t not in files["v"]:
-                ready[name] = None
-                continue
-            if spec["kind"] == "raster":
-                var, scale = spec["source"][1], spec["scale"]
-                v = grid.cut(_values(files["v"][t], var, scale))
-                ready[name] = classes(v, spec["bounds"], spec["clear_below"])
-            elif spec["kind"] == "isobars":
-                hpa = grid.cut(_values(files["v"][t], MSLP[1], 0.01))
-                iso = isobar_mesh(grid.x, grid.y, hpa,
-                                  to_lonlat=grid.transform,
-                                  wrap=getattr(grid, "world", False))
-                ready[name] = (iso, isobar_labels(iso))
-            elif t in files["d"]:
-                kt = grid.barbs(_values(files["v"][t], WIND[1], 1.943844))
-                dd = grid.barbs(_values(files["d"][t], WDIR[1], 1.0))
-                ready[name] = (barb_mesh(grid.barb_lon, grid.barb_lat,
-                                         kt, dd), (None, []))
-            else:
-                ready[name] = None
-        return ready
-
-    def _prepare_all(self):
+    def _work(self):
         while True:
-            with self.lock:
-                todo = [k for k in range(len(self.times))
-                        if self.times[k] not in self.cache
-                        and self.times[k] not in self.claimed]
-                if not todo:
-                    return
-                k = min(todo, key=lambda k: (abs(k - self.i), k < self.i))
-                self.claimed.add(self.times[k])
-            try:
-                self._prepare(self.times[k])
-            except Exception as exc:            # keep the window usable
-                print("Could not prepare", self.times[k], exc)
-                return
-
-    def show(self):
-        pl, t = self.pl, self.time
-        with self.lock:
-            ready = self.cache.get(t)
-        if ready is None:
-            ready = self._prepare(t)
-        for name, spec in LAYERS.items():
-            value = ready.get(name)
-            if spec["kind"] == "raster":
-                for actor in self.actors[name]:
-                    mesh = actor.mapper.dataset
-                    if value is None:
-                        mesh.cell_data["value"][:] = np.nan
-                        mesh.Modified()
-                    else:
-                        mesh.cell_data["value"] = shown(value)
+            job = self._next_job()
+            if job is None:
+                self.wake.wait(0.5)
+                self.wake.clear()
                 continue
-            for actor in self.actors[name]:
+            try:
+                self.prepare(*job)
+            except Exception as exc:            # keep the window usable
+                print("Could not prepare", job, exc)
+                with self.lock:
+                    self.cache[job] = None
+            with self.lock:
+                self.claimed.discard(job)
+            if job[1] == self.time:
+                self.dirty = True
+
+    def prepare(self, lid, t):
+        """One layer at one time, from disk if saved, else computed."""
+        saved = os.path.join(self.disk, f"{lid.replace(':', '_')}_"
+                                        f"{t:%Y%m%dT%H%MZ}.npz")
+        try:
+            value = _load_item(saved)
+        except (OSError, KeyError, ValueError):
+            value = self._compute(lid, t)
+            if value is not None:
+                try:
+                    _save_item(saved, value)
+                except OSError as exc:
+                    print("Could not save", saved, exc)
+        with self.lock:
+            self.cache[(lid, t)] = value
+        return value
+
+    def _field(self, model, param, t, scale=1.0, offset=0.0):
+        path = self.files[model].path(param, t)
+        if path is None:
+            return None
+        return self.grids[model].cut(read_field(path, scale, offset))
+
+    def _rain(self, model, end, period):
+        key = (model, end, period)
+        with self.lock:
+            if key in self.rain:
+                return self.rain[key]
+        path = self.files[model].path(RAIN, end, period)
+        value = None if path is None else self.grids[model].cut(
+            read_field(path, 1000.0))
+        with self.lock:
+            self.rain[key] = value
+        return value
+
+    def rain_total(self, model, t, hours):
+        """Rainfall in the ``hours`` ending at ``t`` from the model's own
+        accumulation files (1-hour, or 3-hour in the Global tail). None
+        if the files do not tile the window exactly or any is missing:
+        a total is never made from part of its hours."""
+        periods = {}
+        for end, period in self.files[model].expected(RAIN):
+            periods.setdefault(end, set()).add(period)
+        total, end, left = None, t, hours
+        while left > 0:
+            fits = [p for p in sorted(periods.get(end, ()), reverse=True)
+                    if p is not None and p <= left]
+            if not fits:
+                return None
+            arr = self._rain(model, end, fits[0])
+            if arr is None:
+                return None
+            total = arr.copy() if total is None else total + arr
+            end -= timedelta(hours=fits[0])
+            left -= fits[0]
+        return total
+
+    def _compute(self, lid, t):
+        model, name = split_id(lid)
+        style, grid = STYLES[name], self.grids[model]
+        if style["kind"] == "raster":
+            if "hours" in style:
+                hours = style["hours"]
+                if hours == "run":
+                    hours = lead_hours(t, self.runs[model])
+                if hours <= 0:
+                    return None
+                values = self.rain_total(model, t, hours)
+            else:
+                values = self._field(model, style["param"], t,
+                                     style.get("scale", 1.0),
+                                     style.get("offset", 0.0))
+            if values is None:
+                return None
+            return classes(values, style["levels"], style.get("clear_below"))
+        if style["kind"] == "barbs":
+            speed = self._field(model, WIND, t, MS_TO_KT)
+            dirn = self._field(model, WDIR, t)
+            if speed is None or dirn is None:
+                return None
+            cut = grid.barb_cut
+            mesh = barb_mesh(grid.barb_lon, grid.barb_lat,
+                             speed[cut].ravel(), dirn[cut].ravel())
+            return mesh, (None, [])
+        hpa = self._field(model, MSLP, t, 0.01)
+        if hpa is None:
+            return None
+        if style["kind"] == "isobars":
+            iso = isobar_mesh(grid.x, grid.y, hpa, to_lonlat=grid.transform,
+                              wrap=grid.world)
+            return iso, isobar_labels(iso)
+        found = find_pressure_centres(hpa, grid.x, grid.y, crs=grid.crs)
+        if not found:
+            return pv.PolyData(), (None, [])
+        lon, lat = grid.lonlat([c["x"] for c in found],
+                               [c["y"] for c in found])
+        pts = xyz(np.asarray(lon), np.asarray(lat)) * 1.007
+        return pv.PolyData(), (pts, [f"{c['letter']} {c['pressure']:.0f}"
+                                     for c in found])
+
+    # ---- drawing ----
+    def refresh(self):
+        """Redraw if something for the shown time became ready."""
+        if self.dirty:
+            self.dirty = False
+            self.show()
+
+    def show(self, render=True, block=False):
+        pl, t = self.pl, self.time
+        for lid in self.layers:
+            model, name = split_id(lid)
+            style = STYLES[name]
+            on = self.is_on(lid)
+            with self.lock:
+                value = self.cache.get((lid, t), PENDING)
+            if on and value is PENDING and block:
+                value = self.prepare(lid, t)
+            if style["kind"] == "raster":
+                actor = self.rasters.get(lid)
+                if actor is None and on:
+                    actor = self._add_raster(lid, self.grids[model].mesh())
+                if actor is None:
+                    continue
+                mesh = actor.mapper.dataset
+                if on and isinstance(value, np.ndarray):
+                    mesh.cell_data["value"] = shown(value)
+                else:
+                    mesh.cell_data["value"][:] = np.nan
+                    mesh.Modified()
+                actor.SetVisibility(on)
+                continue
+            for actor in self.lines[lid]:
                 pl.remove_actor(actor, render=False)
-            self.actors[name] = []
-            if value is None:
+            self.lines[lid] = []
+            if not on or value is PENDING or value is None:
                 continue
             mesh, (pts, labels) = value
             if mesh.n_points:
-                self.actors[name].append(pl.add_mesh(
-                    mesh, color=spec["colour"], zlevel=spec["z"],
-                    line_width=1.5 if spec["kind"] == "isobars" else 1.2))
-            if pts is not None:
-                self.actors[name].append(pl.add_point_labels(
-                    pts, labels, font_size=11, text_color=spec["colour"],
+                self.lines[lid].append(pl.add_mesh(
+                    mesh, color=style["colour"], zlevel=self._z(lid),
+                    line_width=1.5 if style["kind"] == "isobars" else 1.2))
+            if pts is not None and style["kind"] == "centres":
+                for letter, colour in CENTRE_COLOURS.items():
+                    keep = [k for k, s in enumerate(labels)
+                            if s.startswith(letter)]
+                    if keep:
+                        self.lines[lid].append(pl.add_point_labels(
+                            np.asarray(pts)[keep],
+                            [labels[k].replace(" ", "\n") for k in keep],
+                            font_size=15, bold=True, text_color=colour,
+                            shape=None, show_points=False,
+                            always_visible=False, justification_horizontal=
+                            "center", render=False))
+            elif pts is not None:
+                self.lines[lid].append(pl.add_point_labels(
+                    pts, labels, font_size=11, text_color=style["colour"],
                     shape=None, show_points=False, always_visible=False,
                     render=False))
-            for actor in self.actors[name]:
-                actor.SetVisibility(self.visible[name])
-                _set_opacity(actor, self.opacity[name])
+            for actor in self.lines[lid]:
+                _set_opacity(actor, self.opacity[lid])
         pl.add_text(self.caption(), position="upper_left", font_size=10,
                     color="white", name="title")
+        if render:
+            pl.render()
+
+    def leads_text(self):
+        t, out = self.time, []
+        for m in self.models:
+            label = data.MODELS[m]["label"]
+            lead = lead_hours(t, self.runs[m])
+            has = any(v == t for v, _ in self.files[m].expected(MSLP)) or \
+                any(v == t for v, _ in self.files[m].expected(RAIN))
+            out.append(f"{label} T+{lead}" if has and lead >= 0
+                       else f"{label}: no data")
+        return ", ".join(out)
 
     def caption(self):
-        t = self.time
-        ukv = (f"UKV {self.ukv_run} T+{lead_hours(t, self.ukv_run)}"
-               if t in self.files["UKV rain"]["v"] else "UKV: no data")
-        return (f"Valid {t:%a %d %b %H:%M} UTC\n{ukv}, Global "
-                f"{self.glo_run} T+{lead_hours(t, self.glo_run)}\n"
-                "Native model cells, no resampling. Prototype.")
+        return (f"Valid {self.time:%a %d %b %H:%M} UTC\n{self.leads_text()}"
+                "\nNative model cells, no resampling. Prototype.")
 
 
-def _set_opacity(actor, value):
-    """Opacity for a mesh actor or a label actor."""
-    try:
-        actor.GetProperty().SetOpacity(float(value))
-    except AttributeError:
-        try:
-            actor.GetMapper().GetLabelTextProperty().SetOpacity(float(value))
-        except AttributeError:
-            pass
+def wait_until_idle(scene, timeout=600):
+    """Testing helper: prepare every switched-on layer at the shown time."""
+    t0 = _time.time()
+    for lid in scene.layers:
+        if scene.is_on(lid):
+            scene.prepare(lid, scene.time)
+    return _time.time() - t0
