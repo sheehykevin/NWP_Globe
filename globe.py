@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import glob
 import os
+import shutil
 import threading
 import warnings
 from datetime import datetime, timedelta
@@ -47,6 +48,12 @@ COLOURS = ["#9be564", "#2fb344", "#fde725", "#fd9a2a", "#e8322a",
 ISOBARS = np.arange(940, 1061, 4)
 HOME = (-8.0, 53.4, 7.0)            # lon, lat, zoom
 ATLANTIC = (-15.0, 52.0, 2.4)
+# Global area drawn: (west, east, south, north) in degrees, or None for
+# the whole world. A block of the native cells, never resampled.
+AREAS = {"atlantic": (-80.0, 50.0, 15.0, 80.0), "world": None}
+CACHE = os.path.join(HERE, "cache")
+CACHE_VERSION = 1                   # bump when prepared data changes
+KEEP_CACHED_RUNS = 6
 KEY_HELP = ("Left/Right: hour   Down/Up: 6 hours   "
             "h: home   n: north up   q: quit")
 
@@ -108,14 +115,15 @@ def _xyz(lon, lat):
                             np.sin(phi)]).astype(np.float32)
 
 
-def isobar_mesh(lon, lat, hpa):
+def isobar_mesh(lon, lat, hpa, world=True):
     """Isobars from the Global MSLP field as lines on the globe.
 
     contourpy on the 2D grid is about six times faster than VTK
     contouring the globe mesh. The first column is repeated at the end
-    so lines close across the 0/360 seam."""
-    lon = np.append(lon, lon[0] + 360.0)
-    hpa = np.column_stack([hpa, hpa[:, 0]])
+    so lines close across the date line (whole world only)."""
+    if world:
+        lon = np.append(lon, lon[0] + 360.0)
+        hpa = np.column_stack([hpa, hpa[:, 0]])
     gen = contourpy.contour_generator(lon, lat, hpa, line_type="Separate")
     pts, cells, vals, n = [], [], [], 0
     for level in ISOBARS:
@@ -152,24 +160,97 @@ def ukv_mesh(path):
                                 name="rain")
 
 
-def global_mesh(path):
-    with xr.open_dataset(path) as ds:
-        lonb = ds["longitude_bnds"].values
-        latb = ds["latitude_bnds"].values
-    lons = np.append(lonb[:, 0], lonb[-1, 1])
-    lats = np.append(latb[:, 0], latb[-1, 1])
-    return gv.Transform.from_1d(lons, lats,
-                                data=np.full((lats.size - 1, lons.size - 1),
-                                             np.nan), name="rain")
+class GlobalGrid:
+    """The rows and columns of the Global grid inside the chosen area."""
+
+    def __init__(self, path, area):
+        with xr.open_dataset(path) as ds:
+            lonb = ds["longitude_bnds"].values
+            latb = ds["latitude_bnds"].values
+            lon = ds["longitude"].values
+            lat = ds["latitude"].values
+        self.world = area is None
+        if self.world:
+            rows = np.arange(lat.size)
+            cols = np.arange(lon.size)
+        else:
+            west, east, south, north = area
+            rows = np.flatnonzero((latb[:, 1] > south) & (latb[:, 0] < north))
+            cols = np.flatnonzero((lonb[:, 1] > west) & (lonb[:, 0] < east))
+        # Contiguous blocks, so a plain slice picks the cells out.
+        self.rows = slice(rows[0], rows[-1] + 1)
+        self.cols = slice(cols[0], cols[-1] + 1)
+        self.lon, self.lat = lon[self.cols], lat[self.rows]
+        lb, tb = lonb[self.cols], latb[self.rows]
+        self.lon_edges = np.append(lb[:, 0], lb[-1, 1])
+        self.lat_edges = np.append(tb[:, 0], tb[-1, 1])
+
+    def cut(self, values):
+        return values[self.rows, self.cols]
+
+    def mesh(self):
+        shape = (self.lat.size, self.lon.size)
+        return gv.Transform.from_1d(self.lon_edges, self.lat_edges,
+                                    data=np.full(shape, np.nan), name="rain")
 
 
 def grey_texture():
     """Natural Earth I shaded relief, in light grey so coloured
     forecast layers stand out."""
+    saved = os.path.join(CACHE, "grey_base.npy")
+    try:
+        return pv.Texture(np.load(saved))
+    except (OSError, ValueError):
+        pass
     rgb = gv.natural_earth_1().to_array()[..., :3].astype(float)
     grey = rgb @ [0.299, 0.587, 0.114]
     grey = 95.0 + grey * 0.6                     # lighter, less contrast
-    return pv.Texture(np.dstack([grey] * 3).astype(np.uint8))
+    image = np.dstack([grey] * 3).astype(np.uint8)
+    os.makedirs(CACHE, exist_ok=True)
+    np.save(saved, image)
+    return pv.Texture(image)
+
+
+def _save_hour(path, ready):
+    iso = ready["isobars"]
+    pts, labels = ready["labels"]
+    arrays = dict(glo=ready["glo"],
+                  points=np.asarray(iso.points, dtype=np.float32),
+                  lines=np.asarray(iso.lines, dtype=np.int32),
+                  hpa=np.asarray(iso.point_data.get("hPa", []),
+                                 dtype=np.float32),
+                  label_pts=(np.zeros((0, 3), np.float32) if pts is None
+                             else pts.astype(np.float32)),
+                  label_txt=np.array(labels, dtype="U8"))
+    if ready["ukv"] is not None:
+        arrays["ukv"] = ready["ukv"]
+    tmp = path + ".part.npz"
+    np.savez(tmp, **arrays)
+    os.replace(tmp, path)
+
+
+def _load_hour(path):
+    with np.load(path) as f:
+        iso = pv.PolyData()
+        if f["points"].size:
+            iso = pv.PolyData(f["points"], lines=f["lines"])
+            iso.point_data["hPa"] = f["hpa"]
+        pts = f["label_pts"]
+        return dict(glo=f["glo"], ukv=f["ukv"] if "ukv" in f else None,
+                    isobars=iso,
+                    labels=(pts if len(pts) else None,
+                            list(f["label_txt"])))
+
+
+def _prune_cache():
+    """Keep the newest few runs' prepared hours."""
+    try:
+        runs = [d for d in os.scandir(CACHE) if d.is_dir()]
+    except OSError:
+        return
+    runs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+    for d in runs[KEEP_CACHED_RUNS:]:
+        shutil.rmtree(d.path, ignore_errors=True)
 
 
 def isobar_labels(isobars, spacing=0.12):
@@ -214,15 +295,22 @@ class Globe:
 
         self.ukv = ukv_mesh(next(iter(self.ukv_rain.values()))) \
             if self.ukv_rain else None
-        self.glo = global_mesh(self.glo_rain[self.times[0]])
-        with xr.open_dataset(self.glo_mslp[self.times[0]]) as ds:
-            self.lon = ds["longitude"].values
-            self.lat = ds["latitude"].values
+        self.grid = GlobalGrid(self.glo_rain[self.times[0]],
+                               AREAS[args.area])
+        self.glo = self.grid.mesh()
         self.dynamic = []
         # Every hour is prepared in the background, nearest to the
         # shown hour first, so stepping only swaps in ready data.
+        # Prepared hours are also saved, so reopening a run is quick.
         self.cache = {}
+        self.claimed = set()
         self.cache_lock = threading.Lock()
+        self.disk = os.path.join(
+            CACHE, f"v{CACHE_VERSION}_{self.glo_run}_{self.ukv_run}"
+                   f"_{args.area}")
+        os.makedirs(self.disk, exist_ok=True)
+        os.utime(self.disk)                     # newest for pruning
+        _prune_cache()
 
         pl = self.pl = gv.GeoPlotter(off_screen=bool(args.screenshot),
                                      window_size=(1400, 1000))
@@ -235,8 +323,9 @@ class Globe:
                       n_colors=len(LEVELS))
         # GeoVista draws a copy of each mesh: keep the drawn one, so a
         # new time step changes what is on screen.
-        self.glo = pl.add_mesh(self.glo, zlevel=2, opacity=0.85,
-                               **common).mapper.dataset
+        # Opaque: see-through layers make every frame sort millions of
+        # cells, which slows turning the globe.
+        self.glo = pl.add_mesh(self.glo, zlevel=2, **common).mapper.dataset
         if self.ukv is not None:
             self.ukv = pl.add_mesh(self.ukv, zlevel=4,
                                    **common).mapper.dataset
@@ -261,7 +350,10 @@ class Globe:
         pl.add_key_event("n", self.north_up)
         self.show_time()
         if not args.screenshot:
-            threading.Thread(target=self._prepare_all, daemon=True).start()
+            # Two workers: file reading takes turns, the rest overlaps.
+            for _ in range(2):
+                threading.Thread(target=self._prepare_all,
+                                 daemon=True).start()
 
     # ---- view ----
     def go_to(self, lon, lat, zoom):
@@ -289,30 +381,45 @@ class Globe:
 
     def _prepare(self, t):
         """Everything one hour needs on screen, from the raw values."""
-        glo = _classes(_values(self.glo_rain[t],
-                               "lwe_thickness_of_precipitation_amount",
-                               1000.0))
+        saved = os.path.join(self.disk, f"{t:%Y%m%dT%H%MZ}.npz")
+        try:
+            ready = _load_hour(saved)
+        except (OSError, KeyError, ValueError):
+            ready = self._compute(t)
+            try:
+                _save_hour(saved, ready)
+            except OSError as exc:
+                print("Could not save", saved, exc)
+        with self.cache_lock:
+            self.cache[t] = ready
+        return ready
+
+    def _compute(self, t):
+        g = self.grid
+        glo = _classes(g.cut(_values(self.glo_rain[t],
+                                     "lwe_thickness_of_precipitation_amount",
+                                     1000.0)))
         ukv = None
         if self.ukv is not None and t in self.ukv_rain:
             ukv = _classes(_values(self.ukv_rain[t],
                                    "lwe_thickness_of_precipitation_amount",
                                    1000.0))
-        hpa = _values(self.glo_mslp[t], "air_pressure_at_sea_level", 0.01)
-        isobars = isobar_mesh(self.lon, self.lat, hpa)
-        ready = dict(glo=glo, ukv=ukv, isobars=isobars,
-                     labels=isobar_labels(isobars))
-        with self.cache_lock:
-            self.cache[t] = ready
-        return ready
+        hpa = g.cut(_values(self.glo_mslp[t], "air_pressure_at_sea_level",
+                            0.01))
+        isobars = isobar_mesh(g.lon, g.lat, hpa, world=g.world)
+        return dict(glo=glo, ukv=ukv, isobars=isobars,
+                    labels=isobar_labels(isobars))
 
     def _prepare_all(self):
         while True:
             with self.cache_lock:
                 todo = [k for k in range(len(self.times))
-                        if self.times[k] not in self.cache]
-            if not todo:
-                return
-            k = min(todo, key=lambda k: (abs(k - self.i), k < self.i))
+                        if self.times[k] not in self.cache
+                        and self.times[k] not in self.claimed]
+                if not todo:
+                    return
+                k = min(todo, key=lambda k: (abs(k - self.i), k < self.i))
+                self.claimed.add(self.times[k])
             try:
                 self._prepare(self.times[k])
             except Exception as exc:            # keep the window usable
@@ -372,6 +479,8 @@ def main():
     ap.add_argument("--valid", help="start time, e.g. 20261116T0300Z "
                     "(default: first hour both models cover)")
     ap.add_argument("--base", choices=["grey", "colour"], default="grey")
+    ap.add_argument("--area", choices=sorted(AREAS), default="atlantic",
+                    help="Global area drawn (default: %(default)s)")
     ap.add_argument("--view", choices=["ireland", "atlantic"],
                     default="ireland")
     ap.add_argument("--steps", type=int, default=0,

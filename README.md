@@ -38,14 +38,30 @@ zoom, Shift+drag to pan.
 | `--ukv-run`, `--global-run` | Runs to show, e.g. `20261115T2100Z` (default: newest in the archive) |
 | `--valid TIME` | Starting valid time, e.g. `20261116T0300Z` (default: first hour both models cover) |
 | `--base grey` / `colour` | Background: Natural Earth I shaded relief in grey (default) or in colour |
+| `--area atlantic` / `world` | Global area drawn (default `atlantic`) |
 | `--view ireland` / `atlantic` | Starting view |
 | `--screenshot FILE` | Write a PNG and exit (`--steps N` steps N hours first) |
 
 Times step through the Global run's hours; UKV is shown for the hours
-its run covers. Once the window is open every hour is prepared in the
-background, nearest hours first (about 0.7 s each, so a 54-hour run is
-ready after roughly 40 s); a prepared hour appears at once. All hours
-together take roughly 0.5-0.6 GB of memory. Isobars (Global MSLP, every 4 hPa) are labelled about
+its run covers.
+
+Global is drawn for the North Atlantic and Europe (80°W-50°E,
+15-80°N) by default, a block of its native cells; `--area world` draws
+it all.
+
+Once the window is open, two background workers prepare every hour,
+nearest hours first, and save them in `cache\` (newest 6 runs kept), so
+reopening a run is quick. Measured on a 54-hour run:
+
+| | `atlantic` | `world` |
+|---|---|---|
+| All hours ready, first opening | 11 s | 31 s |
+| All hours ready, reopening | 0.3 s | 0.6 s |
+| One step | 0.01 s | 0.06 s |
+| Memory for all hours | 0.12 GB | 0.56 GB |
+| Disk cache per run | 117 MB | 565 MB |
+
+The grey background is made once and saved in `cache\`. Isobars (Global MSLP, every 4 hPa) are labelled about
 every 750 km.
 
 The archive layout is `<archive>/<model>/<run>/<parameter>/*.nc`, as
