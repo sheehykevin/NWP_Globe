@@ -21,15 +21,29 @@ conda env create -f environment.yml
 conda run -n ukmo_globe python globe.py
 ```
 
-Drag to rotate, scroll to zoom. Options:
+Opens on Ireland. Drag to turn the globe (north stays up), scroll to
+zoom, Shift+drag to pan.
+
+| Key | Action |
+|---|---|
+| Right / Left | Next / previous hour |
+| Up / Down | Six hours on / back |
+| h | Home: the Ireland view, north up |
+| n | North up from the current view |
+| q | Quit |
 
 | Option | Meaning |
 |---|---|
 | `--archive PATH` | Download archive of the UKMO NWP tools (default `..\ukmo_nwp\data\archive`) |
-| `--ukv-run`, `--ukv-lead` | UKV run (`20261115T2100Z`) and lead hour |
-| `--global-run`, `--global-lead` | Global run and lead hour; pick leads with the same valid time |
+| `--ukv-run`, `--global-run` | Runs to show, e.g. `20261115T2100Z` (default: newest in the archive) |
+| `--valid TIME` | Starting valid time, e.g. `20261116T0300Z` (default: first hour both models cover) |
+| `--base grey` / `colour` | Background: Natural Earth I shaded relief in grey (default) or in colour |
 | `--view ireland` / `atlantic` | Starting view |
-| `--screenshot FILE` | Write a PNG and exit |
+| `--screenshot FILE` | Write a PNG and exit (`--steps N` steps N hours first) |
+
+Times step through the Global run's hours; UKV is shown for the hours
+its run covers. Isobars (Global MSLP, every 4 hPa) are labelled about
+every 750 km.
 
 The archive layout is `<archive>/<model>/<run>/<parameter>/*.nc`, as
 written by the UKMO NWP tools.
