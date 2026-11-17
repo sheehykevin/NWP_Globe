@@ -43,8 +43,11 @@ IBI_PARAMS = {"VHM0": "sea_surface_wave_significant_height",
               "VMDR": "sea_surface_wave_from_direction"}
 
 # HARMONIE GRIB1 fields kept (KNMI local table 253), by
-# (indicatorOfParameter, indicatorOfTypeOfLevel, level). Only fields
-# found in the downloaded run are written; the inventory lists all.
+# (indicatorOfParameter, indicatorOfTypeOfLevel, level), as found in a
+# P4a control file on 17 Nov 2026 (docs/harmonie_inventory.md lists all).
+# Rain, snow and graupel are accumulated from the run start (time range
+# 4, P1=0); gusts are the maximum over the past hour (time range 2).
+# P4a has no CAPE.
 HARMONIE_FIELDS = {
     (1, 103, 0): "mslp",
     (11, 105, 2): "t2m",
@@ -52,9 +55,11 @@ HARMONIE_FIELDS = {
     (34, 105, 10): "v10",
     (162, 105, 10): "ugust",
     (163, 105, 10): "vgust",
-    (61, 105, 0): "tp_acc",
-    (160, 105, 0): "cape",
+    (181, 105, 0): "rain_acc",
+    (184, 105, 0): "snow_acc",
+    (201, 105, 0): "graupel_acc",
 }
+PRECIP_PARTS = ("rain_acc", "snow_acc", "graupel_acc")
 
 
 def _say(*args):
@@ -228,10 +233,12 @@ def fetch_harmonie(run=None):
                 for msg in _grib_messages(buf):
                     gid = ec.codes_new_from_message(msg)
                     try:
-                        key = tuple(ec.codes_get(gid, k) for k in (
+                        # As numbers: plain codes_get gives level type
+                        # names ("sfc") instead of the codes.
+                        key = tuple(ec.codes_get_long(gid, k) for k in (
                             "indicatorOfParameter", "indicatorOfTypeOfLevel",
                             "level"))
-                        tri = ec.codes_get(gid, "timeRangeIndicator")
+                        tri = ec.codes_get_long(gid, "timeRangeIndicator")
                         inventory.setdefault(key, set()).add(tri)
                         if key in HARMONIE_FIELDS:
                             if grid is None:
@@ -246,6 +253,7 @@ def fetch_harmonie(run=None):
                         ec.codes_release(gid)
                 _store_harmonie(run_time, lead, fields, grid, acc_prev)
                 _say(f"  T+{lead}: {', '.join(sorted(fields)) or 'none'}")
+    _store_precip(run_time, acc_prev, grid)
     _write_inventory(name, inventory)
     if not seen:
         raise SystemExit("No control-member files found in the archive")
@@ -270,8 +278,6 @@ def _store_harmonie(run, lead, f, grid, acc_prev):
         put("pressure_at_mean_sea_level", f["mslp"], "Pa")
     if "t2m" in f:
         put("temperature_at_screen_level", f["t2m"], "K")
-    if "cape" in f:
-        put("CAPE_most_unstable_below_500hPa", f["cape"], "J kg-1")
     if "u10" in f and "v10" in f:
         u, v = _to_true_north(f["u10"], f["v10"], x, y, attrs)
         put("wind_speed_at_10m", np.hypot(u, v), "m s-1")
@@ -279,12 +285,26 @@ def _store_harmonie(run, lead, f, grid, acc_prev):
             np.degrees(np.arctan2(-u, -v)) % 360.0, "degrees")
     if "ugust" in f and "vgust" in f:
         put("wind_gust_at_10m", np.hypot(f["ugust"], f["vgust"]), "m s-1")
-    if "tp_acc" in f:
-        # Accumulated from the run start: the hour's rain is the step.
-        if lead - 1 in acc_prev:
-            put("precipitation_accumulation",
-                (f["tp_acc"] - acc_prev[lead - 1]) / 1000.0, "m", period=1)
-        acc_prev[lead] = f["tp_acc"]
+    if all(p in f for p in PRECIP_PARTS):
+        # Total precipitation (rain + snow + graupel, kg m-2 = mm) since
+        # the run start; hours arrive out of order, so the hourly steps
+        # are taken once the whole run is in (_store_precip).
+        acc_prev[lead] = sum(f[p] for p in PRECIP_PARTS).astype(np.float32)
+
+
+def _store_precip(run, acc, grid):
+    """Hourly precipitation: the step between consecutive leads."""
+    if grid is None:
+        return
+    x, y, attrs = grid
+    order = np.argsort(y)
+    coords = {"rlon": ("x", x), "rlat": ("y", y[order])}
+    for lead in sorted(acc):
+        if lead - 1 in acc:
+            hour = (acc[lead] - acc[lead - 1]) / 1000.0     # mm -> m
+            _write("harmonie", run, "precipitation_accumulation",
+                   run + timedelta(hours=lead), lead, hour[order], coords,
+                   {**attrs, "units": "m"}, period=1)
 
 
 def _to_true_north(u, v, x, y, attrs):

@@ -337,15 +337,21 @@ def run_window(args):
             os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "globe_fetch.py"), what])
 
+    last = [""]
+
     def fetch_output():
         text = bytes(fetch_proc.readAll()).decode("utf-8", "replace")
         lines = [s for s in text.splitlines() if s.strip()]
         if lines:
-            fetch_note.setText("  " + lines[-1][:80])
+            last[0] = lines[-1].strip()
+            fetch_note.setText("  " + last[0][:90])
 
     def fetch_done(code, _status):
-        fetch_note.setText("  fetched: Reload to show it" if code == 0
-                           else "  fetch failed (see the last message)")
+        if code == 0:
+            fetch_note.setText("  fetched: Fetch > Reload the globe")
+        else:
+            fetch_note.setText("  fetch failed: " + last[0][:90])
+        fetch_note.setToolTip(last[0])
     fetch_proc.readyRead.connect(fetch_output)
     fetch_proc.finished.connect(fetch_done)
     fetch_menu.addAction("HARMONIE: latest KNMI run (about 6 GB "

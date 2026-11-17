@@ -77,9 +77,10 @@ to true north; its hourly rain is the step in its run accumulation.
   `KNMI_API_KEY=...` (git-ignored).
 - **Copernicus Marine**: run `copernicusmarine login` once.
 - The first HARMONIE fetch writes `docs\harmonie_inventory.md`, every
-  GRIB field in the control member. Fields taken now: MSLP, 2 m
-  temperature, 10 m wind, gust, CAPE, accumulated precipitation, by their
-  KNMI table numbers; any not in the run are left out.
+  GRIB field in the control member. Taken: MSLP, 2 m temperature,
+  10 m wind, hourly-maximum gust, and precipitation (rain + snow +
+  graupel, accumulated from the run start; hourly amounts are the
+  steps). P4a has no CAPE. Leads T+0 to T+60, hourly.
 
 ## Data
 
