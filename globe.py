@@ -1,580 +1,304 @@
-"""3D globe: UKV and Global rainfall and MSLP on one globe (prototype).
+"""3D globe for UKV and Global model output (prototype).
 
-Reads the download archive written by the UKMO NWP tools
-(<archive>/ukv/<run>/<parameter>/*.nc, <archive>/global10km/...).
+A Qt window around the globe in ``globe_core.py``: a layer panel (on/off
+and transparency for each layer, with its colour key) and a time bar
+(first, back, play, forward, last, a time slider and play speed), as in
+the UKMO NWP viewer.
 
     conda env create -f environment.yml
-    conda run -n ukmo_globe python globe.py --archive PATH
+    conda run -n ukmo_globe python globe.py [--archive PATH]
 
-Each model is drawn on its own native cells: every cell is a quad built
-from the file's cell bounds (UKV in its Lambert equal-area metres
-turned into longitude/latitude by pyproj, Global straight from its
-latitude/longitude bounds). Nothing is resampled; the value on a cell is
-the value in the file. UKV sits on top of Global where the two overlap.
-MSLP from each model is drawn as labelled isobars.
-
-Keys: Left/Right one hour, Up/Down (or Page Up/Page Down) six hours,
-h home (Ireland, north up), n north up from the current view. Dragging
-keeps north up. Buttons on the left switch each layer on and off.
+Keys: Left/Right one hour, Up/Down six hours, Space play/pause, Home and
+End first/last hour, h home view (Ireland, north up), n north up.
 """
 
 from __future__ import annotations
 
 import argparse
-import glob
-import os
-import shutil
-import threading
-import warnings
-from datetime import datetime, timedelta
+import sys
 
-import contourpy
-import geovista as gv
-import numpy as np
-import pyvista as pv
-import xarray as xr
-from pyproj import CRS, Transformer
+import globe_core as core
+from globe_core import LAYERS
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-# Default: the UKMO NWP tools' archive next to this project.
-ARCHIVE = os.path.normpath(os.path.join(HERE, "..", "ukmo_nwp", "data",
-                                        "archive"))
-RAIN = "precipitation_accumulation"
-MSLP = "pressure_at_mean_sea_level"
-RAIN_VAR = "lwe_thickness_of_precipitation_amount"
-MSLP_VAR = "air_pressure_at_sea_level"
-# Rainfall colour steps (mm in the hour), roughly as on the pages.
-LEVELS = [0.1, 0.5, 1, 2, 4, 8, 16]
-# Radar-style colours; they stand out on the grey base.
-COLOURS = ["#9be564", "#2fb344", "#fde725", "#fd9a2a", "#e8322a",
-           "#c51b8a", "#7a0177"]
-ISOBARS = np.arange(940, 1061, 4)
-# Layers the buttons switch, with the colour of their button / lines.
-LAYERS = {"Global rain": "#2fb344", "UKV rain": "#9be564",
-          "Global MSLP": "#1a1a1a", "UKV MSLP": "#1f4fbf"}
-ISOBAR_COLOUR = {"Global MSLP": "#1a1a1a", "UKV MSLP": "#1f4fbf"}
-HOME = (-8.0, 53.4, 7.0)            # lon, lat, zoom
-ATLANTIC = (-15.0, 52.0, 2.4)
-# Global area drawn: (west, east, south, north) in degrees, or None for
-# the whole world. A block of the native cells, never resampled.
-AREAS = {"atlantic": (-80.0, 50.0, 15.0, 80.0), "world": None}
-CACHE = os.path.join(HERE, "cache")
-CACHE_VERSION = 2                   # bump when prepared data changes
-KEEP_CACHED_RUNS = 6
-KEY_HELP = ("Left/Right: hour   Up/Down: 6 hours   "
-            "h: home   n: north up   q: quit")
-
-# Isobar points are made on the globe already, so GeoVista's "no CRS"
-# warning for them means nothing.
-warnings.filterwarnings("ignore", message="geovista found no coordinate")
-# NetCDF/HDF5 reading is not safe from two threads at once.
-READ_LOCK = threading.Lock()
-DRY = 255                           # class code: dry or missing
+STYLE = """
+QWidget { font-size: 10pt; }
+QGroupBox { font-weight: bold; margin-top: 8px; }
+QGroupBox::title { subcontrol-origin: margin; left: 6px; }
+"""
 
 
-def _stamp(text):
-    return datetime.strptime(text, "%Y%m%dT%H%MZ")
+def _colour_key(spec, QtGui, QtCore):
+    """A colour key as a picture: one swatch per band, its lower bound
+    under it, units below; a line sample for line layers."""
+    w, h = 250, 44
+    pix = QtGui.QPixmap(w, h)
+    pix.fill(QtCore.Qt.transparent)
+    p = QtGui.QPainter(pix)
+    font = p.font()
+    font.setPointSize(7)
+    p.setFont(font)
+    if spec["kind"] == "raster":
+        n = len(spec["colours"])
+        cw = (w - 20) // n
+        for k, colour in enumerate(spec["colours"]):
+            p.fillRect(k * cw, 0, cw, 12, QtGui.QColor(colour))
+            p.setPen(QtGui.QColor("#888888"))
+            p.drawRect(k * cw, 0, cw, 12)
+            p.setPen(QtGui.QColor("#202020"))
+            p.drawText(k * cw, 14, cw, 12, QtCore.Qt.AlignLeft,
+                       f"{spec['bounds'][k]:g}")
+        p.setPen(QtGui.QColor("#555555"))
+        p.drawText(0, 28, w, 14, QtCore.Qt.AlignLeft, spec["units"])
+    else:
+        pen = QtGui.QPen(QtGui.QColor(spec["colour"]))
+        pen.setWidth(2)
+        p.setPen(pen)
+        p.drawLine(0, 7, 40, 7)
+        p.setPen(QtGui.QColor("#555555"))
+        p.drawText(48, 0, w - 48, 14, QtCore.Qt.AlignLeft,
+                   "isobars every 4 hPa" if spec["kind"] == "isobars"
+                   else "knots: half 5, full 10, pennant 50")
+        h = 16
+    p.end()
+    return pix.copy(0, 0, w, h)
 
 
-def _index(model, run, param):
-    """{valid time: file} for one run and parameter. The valid time is
-    the first part of each file name."""
-    out = {}
-    for path in glob.glob(os.path.join(ARCHIVE, model, run, param, "*.nc")):
-        out[_stamp(os.path.basename(path).split("-")[0])] = path
-    return out
+def run_window(args):
+    from geovista.qt import GeoQtInteractor
+    from qtpy import QtCore, QtGui, QtWidgets
 
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    app.setStyle("Fusion")
+    app.setStyleSheet(STYLE)
 
-def _latest_run(model):
-    runs = sorted(os.listdir(os.path.join(ARCHIVE, model)))
-    if not runs:
-        raise SystemExit(f"No {model} runs in {ARCHIVE}")
-    return runs[-1]
+    win = QtWidgets.QMainWindow()
+    win.setWindowTitle("UKMO NWP Globe")
+    win.resize(1500, 950)
+    view = GeoQtInteractor()
+    win.setCentralWidget(view)
+    scene = core.Scene(view, ukv_run=args.ukv_run,
+                       global_run=args.global_run, valid=args.valid,
+                       area=args.area, base=args.base, view=args.view)
+    # PyVista zooms on Up/Down by default; here they step time.
+    for key in ("Up", "Down"):
+        view.clear_events_for_key(key)
 
+    # ---- layer panel ----
+    panel = QtWidgets.QWidget()
+    lay = QtWidgets.QVBoxLayout(panel)
+    for name, spec in reversed(list(LAYERS.items())):   # top layer first
+        box = QtWidgets.QGroupBox()
+        grid = QtWidgets.QGridLayout(box)
+        tick = QtWidgets.QCheckBox(name)
+        tick.setChecked(scene.visible[name])
+        tick.setEnabled(scene.available(name))
+        tick.toggled.connect(lambda on, n=name: scene.set_visible(n, on))
+        slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        slider.setRange(0, 100)
+        slider.setValue(int(round(scene.opacity[name] * 100)))
+        slider.setFocusPolicy(QtCore.Qt.NoFocus)
+        slider.setToolTip("Opacity")
+        value = QtWidgets.QLabel(f"{slider.value()} %")
+        value.setMinimumWidth(36)
 
-def _values(path, name, scale):
-    """Raw values from one file (scaled to mm or hPa only)."""
-    with READ_LOCK, xr.open_dataset(path) as ds:
-        return ds[name].values * scale
+        def moved(v, n=name, label=value):
+            label.setText(f"{v} %")
+            scene.set_opacity(n, v / 100.0)
+        slider.valueChanged.connect(moved)
+        grid.addWidget(tick, 0, 0, 1, 2)
+        grid.addWidget(slider, 1, 0)
+        grid.addWidget(value, 1, 1)
+        key = QtWidgets.QLabel()
+        key.setPixmap(_colour_key(spec, QtGui, QtCore))
+        grid.addWidget(key, 2, 0, 1, 2)
+        if not scene.available(name):
+            box.setToolTip("No data for this run in the archive")
+        lay.addWidget(box)
+    lay.addStretch(1)
+    note = QtWidgets.QLabel("Native model cells, no resampling.\n"
+                            "Wind: UKV only (no Global wind in the "
+                            "archive).")
+    note.setStyleSheet("color:#555;font-size:8pt")
+    lay.addWidget(note)
+    scroll = QtWidgets.QScrollArea()
+    scroll.setWidget(panel)
+    scroll.setWidgetResizable(True)
+    dock = QtWidgets.QDockWidget("Layers", win)
+    dock.setWidget(scroll)
+    dock.setFeatures(QtWidgets.QDockWidget.DockWidgetMovable
+                     | QtWidgets.QDockWidget.DockWidgetFloatable)
+    dock.setMinimumWidth(280)
+    win.addDockWidget(QtCore.Qt.RightDockWidgetArea, dock)
 
+    # ---- time bar ----
+    bar = QtWidgets.QToolBar("Time")
+    bar.setMovable(False)
+    win.addToolBar(QtCore.Qt.BottomToolBarArea, bar)
+    style = win.style()
+    sp = QtWidgets.QStyle
 
-def _classes(mm):
-    """mm -> colour class 0..6 as bytes, DRY for dry and missing cells
-    (stored small so every hour can be kept in memory)."""
-    out = (np.digitize(mm, LEVELS) - 1).astype(np.uint8)
-    out[~np.isfinite(mm) | (mm < LEVELS[0])] = DRY
-    return out.ravel()
+    def button(icon, tip, slot):
+        act = bar.addAction(style.standardIcon(icon), tip)
+        act.triggered.connect(slot)
+        return act
 
+    timer = QtCore.QTimer(win)
+    slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+    slider.setRange(0, len(scene.times) - 1)
+    slider.setFocusPolicy(QtCore.Qt.NoFocus)
+    slider.setMinimumWidth(400)
+    label = QtWidgets.QLabel()
+    label.setMinimumWidth(330)
+    status = QtWidgets.QLabel()
 
-def _shown(classes):
-    """Class bytes -> what the mesh draws; DRY becomes see-through."""
-    out = classes.astype(np.float32)
-    out[classes == DRY] = np.nan
-    return out
+    def go(i):
+        scene.go(i)
+        if slider.value() != scene.i:
+            slider.blockSignals(True)
+            slider.setValue(scene.i)
+            slider.blockSignals(False)
+        t = scene.time
+        label.setText(f"  {t:%a %d %b %H:%M} UTC   Global "
+                      f"T+{core.lead_hours(t, scene.glo_run)}"
+                      + (f"  UKV T+{core.lead_hours(t, scene.ukv_run)}"
+                         if t in scene.files["UKV rain"]["v"] else
+                         "  UKV: no data"))
 
-
-def _xyz(lon, lat):
-    """Longitude/latitude -> points on GeoVista's unit globe."""
-    lam, phi = np.radians(lon), np.radians(lat)
-    return np.column_stack([np.cos(phi) * np.cos(lam),
-                            np.cos(phi) * np.sin(lam),
-                            np.sin(phi)]).astype(np.float32)
-
-
-def isobar_mesh(x, y, hpa, to_lonlat=None, wrap=False):
-    """Isobars as lines on the globe, contoured on the model's own grid.
-
-    ``x``/``y`` are the cell centres (degrees, or projection metres with
-    ``to_lonlat`` turning line points into longitude/latitude). contourpy
-    on the 2D grid is about six times faster than VTK contouring the
-    globe mesh. With ``wrap`` the first column is repeated at the end so
-    lines close across the date line (whole-world Global)."""
-    if wrap:
-        x = np.append(x, x[0] + 360.0)
-        hpa = np.column_stack([hpa, hpa[:, 0]])
-    gen = contourpy.contour_generator(x, y, hpa, line_type="Separate")
-    pts, cells, vals, n = [], [], [], 0
-    for level in ISOBARS:
-        for line in gen.lines(level):
-            if len(line) < 2:
-                continue
-            pts.append(line)
-            cells.append(np.concatenate([[len(line)],
-                                         np.arange(n, n + len(line))]))
-            vals.append(np.full(len(line), level, dtype=np.float32))
-            n += len(line)
-    if not pts:
-        return pv.PolyData()
-    xy = np.concatenate(pts)
-    lon, lat = (to_lonlat(xy[:, 0], xy[:, 1]) if to_lonlat
-                else (xy[:, 0], xy[:, 1]))
-    mesh = pv.PolyData(_xyz(lon, lat), lines=np.concatenate(cells))
-    mesh.point_data["hPa"] = np.concatenate(vals)
-    return mesh
-
-
-def isobar_labels(isobars, spacing=0.12):
-    """Isobar values at points along the lines, about one per
-    ``spacing``-sized box (globe radii; 0.12 is about 750 km), lifted
-    just off the globe so the layers under them do not hide them."""
-    if isobars.n_points == 0:
-        return None, []
-    xyz = isobars.points
-    hpa = isobars.point_data["hPa"]
-    # One label per box and isobar value: the point nearest the box
-    # centre, so labels sit where the line crosses the box middle.
-    box = np.floor(xyz / spacing).astype(np.int64)
-    off = np.sum((xyz / spacing - box - 0.5) ** 2, axis=1)
-    key = np.column_stack([box, np.rint(hpa).astype(np.int64)])
-    order = np.lexsort((off, *key.T[::-1]))
-    _, first = np.unique(key[order], axis=0, return_index=True)
-    kept = order[first]
-    # Boxes in a chequerboard only, so neighbours' labels do not touch.
-    kept = kept[np.sum(box[kept], axis=1) % 2 == 0]
-    return xyz[kept] * 1.004, [f"{hpa[i]:.0f}" for i in kept]
-
-
-class UkvGrid:
-    """The UKV grid: cell corners on the globe and its projection."""
-
-    def __init__(self, path):
-        with xr.open_dataset(path) as ds:
-            var = ds[RAIN_VAR] if RAIN_VAR in ds else ds[MSLP_VAR]
-            crs = CRS.from_cf(ds[var.attrs["grid_mapping"]].attrs)
-            xb = ds["projection_x_coordinate_bnds"].values
-            yb = ds["projection_y_coordinate_bnds"].values
-            self.x = ds["projection_x_coordinate"].values
-            self.y = ds["projection_y_coordinate"].values
-        self.transform = Transformer.from_crs(crs, "EPSG:4326",
-                                              always_xy=True).transform
-        self.x_edges = np.append(xb[:, 0], xb[-1, 1])
-        self.y_edges = np.append(yb[:, 0], yb[-1, 1])
-
-    def mesh(self):
-        xx, yy = np.meshgrid(self.x_edges, self.y_edges)
-        lon, lat = self.transform(xx, yy)
-        shape = (self.y.size, self.x.size)
-        return gv.Transform.from_2d(lon, lat, data=np.full(shape, np.nan),
-                                    name="rain")
-
-
-class GlobalGrid:
-    """The rows and columns of the Global grid inside the chosen area."""
-
-    def __init__(self, path, area):
-        with xr.open_dataset(path) as ds:
-            lonb = ds["longitude_bnds"].values
-            latb = ds["latitude_bnds"].values
-            lon = ds["longitude"].values
-            lat = ds["latitude"].values
-        self.world = area is None
-        if self.world:
-            rows = np.arange(lat.size)
-            cols = np.arange(lon.size)
+    def play_pause():
+        if timer.isActive():
+            timer.stop()
+            play.setIcon(style.standardIcon(sp.SP_MediaPlay))
         else:
-            west, east, south, north = area
-            rows = np.flatnonzero((latb[:, 1] > south) & (latb[:, 0] < north))
-            cols = np.flatnonzero((lonb[:, 1] > west) & (lonb[:, 0] < east))
-        # Contiguous blocks, so a plain slice picks the cells out.
-        self.rows = slice(rows[0], rows[-1] + 1)
-        self.cols = slice(cols[0], cols[-1] + 1)
-        self.lon, self.lat = lon[self.cols], lat[self.rows]
-        lb, tb = lonb[self.cols], latb[self.rows]
-        self.lon_edges = np.append(lb[:, 0], lb[-1, 1])
-        self.lat_edges = np.append(tb[:, 0], tb[-1, 1])
+            if scene.i == len(scene.times) - 1:
+                go(0)
+            timer.start()
+            play.setIcon(style.standardIcon(sp.SP_MediaPause))
 
-    def cut(self, values):
-        return values[self.rows, self.cols]
+    def tick():
+        nxt = scene.i + 1
+        if nxt >= len(scene.times):
+            play_pause()                     # stop at the last hour
+        elif scene.is_ready(nxt):            # wait for it otherwise
+            go(nxt)
 
-    def mesh(self):
-        shape = (self.lat.size, self.lon.size)
-        return gv.Transform.from_1d(self.lon_edges, self.lat_edges,
-                                    data=np.full(shape, np.nan), name="rain")
+    timer.timeout.connect(tick)
+    button(sp.SP_MediaSkipBackward, "First hour (Home)", lambda: go(0))
+    button(sp.SP_MediaSeekBackward, "Back one hour (Left)",
+           lambda: go(scene.i - 1))
+    play = button(sp.SP_MediaPlay, "Play / pause (Space)", play_pause)
+    button(sp.SP_MediaSeekForward, "On one hour (Right)",
+           lambda: go(scene.i + 1))
+    button(sp.SP_MediaSkipForward, "Last hour (End)",
+           lambda: go(len(scene.times) - 1))
+    bar.addWidget(slider)
+    slider.valueChanged.connect(go)
+    speed = QtWidgets.QComboBox()
+    for text, ms in (("0.5 h/s", 2000), ("1 h/s", 1000), ("2 h/s", 500),
+                     ("4 h/s", 250)):
+        speed.addItem(text, ms)
+    speed.setCurrentIndex(2)
+    speed.setFocusPolicy(QtCore.Qt.NoFocus)
+    timer.setInterval(speed.currentData())
+    speed.currentIndexChanged.connect(
+        lambda _: timer.setInterval(speed.currentData()))
+    bar.addWidget(speed)
+    bar.addWidget(label)
+    bar.addSeparator()
+    home = bar.addAction("Home view")
+    home.setToolTip("Ireland, north up (h)")
+    home.triggered.connect(scene.go_home)
+    north = bar.addAction("North up")
+    north.setToolTip("Turn north back to up (n)")
+    north.triggered.connect(lambda: scene.north_up())
+    bar.addSeparator()
+    bar.addWidget(status)
 
+    def progress():
+        n, total = scene.n_ready(), len(scene.times)
+        status.setText(f"  {n}/{total} hours ready" if n < total
+                       else f"  all {total} hours ready")
+    poll = QtCore.QTimer(win)
+    poll.timeout.connect(progress)
+    poll.start(500)
 
-def grey_texture():
-    """Natural Earth I shaded relief, in light grey so coloured
-    forecast layers stand out. Made once and saved."""
-    saved = os.path.join(CACHE, "grey_base.npy")
-    try:
-        return pv.Texture(np.load(saved))
-    except (OSError, ValueError):
-        pass
-    rgb = gv.natural_earth_1().to_array()[..., :3].astype(float)
-    grey = rgb @ [0.299, 0.587, 0.114]
-    grey = 95.0 + grey * 0.6                     # lighter, less contrast
-    image = np.dstack([grey] * 3).astype(np.uint8)
-    os.makedirs(CACHE, exist_ok=True)
-    np.save(saved, image)
-    return pv.Texture(image)
+    shortcuts = (("Right", lambda: go(scene.i + 1)),
+                 ("Left", lambda: go(scene.i - 1)),
+                 ("Up", lambda: go(scene.i + 6)),
+                 ("Down", lambda: go(scene.i - 6)),
+                 ("PgUp", lambda: go(scene.i + 6)),
+                 ("PgDown", lambda: go(scene.i - 6)),
+                 ("Home", lambda: go(0)),
+                 ("End", lambda: go(len(scene.times) - 1)),
+                 ("Space", play_pause),
+                 ("H", scene.go_home),
+                 ("N", lambda: scene.north_up()))
+    for keys, slot in shortcuts:
+        sc = QtWidgets.QShortcut(keys, win)
+        sc.setContext(QtCore.Qt.ApplicationShortcut)
+        sc.activated.connect(slot)
 
-
-# ---- prepared hours on disk -------------------------------------------
-
-def _pack_isobars(prefix, iso, labels, out):
-    pts, txt = labels
-    out[f"{prefix}_points"] = np.asarray(iso.points, dtype=np.float32)
-    out[f"{prefix}_lines"] = np.asarray(iso.lines, dtype=np.int32)
-    out[f"{prefix}_hpa"] = np.asarray(iso.point_data.get("hPa", []),
-                                      dtype=np.float32)
-    out[f"{prefix}_label_pts"] = (np.zeros((0, 3), np.float32)
-                                  if pts is None else pts.astype(np.float32))
-    out[f"{prefix}_label_txt"] = np.array(txt, dtype="U8")
-
-
-def _unpack_isobars(prefix, f):
-    if f"{prefix}_points" not in f:
-        return None, (None, [])
-    iso = pv.PolyData()
-    if f[f"{prefix}_points"].size:
-        iso = pv.PolyData(f[f"{prefix}_points"], lines=f[f"{prefix}_lines"])
-        iso.point_data["hPa"] = f[f"{prefix}_hpa"]
-    pts = f[f"{prefix}_label_pts"]
-    return iso, (pts if len(pts) else None, list(f[f"{prefix}_label_txt"]))
-
-
-def _save_hour(path, ready):
-    arrays = dict(glo=ready["glo"])
-    if ready["ukv"] is not None:
-        arrays["ukv"] = ready["ukv"]
-    for prefix, key in (("g", "Global MSLP"), ("u", "UKV MSLP")):
-        iso, labels = ready[key]
-        if iso is not None:
-            _pack_isobars(prefix, iso, labels, arrays)
-    tmp = path + ".part.npz"
-    np.savez(tmp, **arrays)
-    os.replace(tmp, path)
-
-
-def _load_hour(path):
-    with np.load(path) as f:
-        return {"glo": f["glo"],
-                "ukv": f["ukv"] if "ukv" in f else None,
-                "Global MSLP": _unpack_isobars("g", f),
-                "UKV MSLP": _unpack_isobars("u", f)}
-
-
-def _prune_cache():
-    """Keep the newest few runs' prepared hours."""
-    try:
-        runs = [d for d in os.scandir(CACHE) if d.is_dir()]
-    except OSError:
-        return
-    runs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
-    for d in runs[KEEP_CACHED_RUNS:]:
-        shutil.rmtree(d.path, ignore_errors=True)
+    go(scene.i)
+    progress()
+    scene.start_workers()
+    win.show()
+    if args.smoke:
+        # Testing: save a picture of the whole window, then close.
+        def grab():
+            win.grab().save(args.smoke)
+            print("wrote", args.smoke)
+            app.quit()
+        QtCore.QTimer.singleShot(args.smoke_wait * 1000, grab)
+    return app.exec_()
 
 
-class Globe:
-    def __init__(self, args):
-        self.ukv_run = args.ukv_run or _latest_run("ukv")
-        self.glo_run = args.global_run or _latest_run("global10km")
-        self.ukv_rain = _index("ukv", self.ukv_run, RAIN)
-        self.ukv_mslp = _index("ukv", self.ukv_run, MSLP)
-        self.glo_rain = _index("global10km", self.glo_run, RAIN)
-        self.glo_mslp = _index("global10km", self.glo_run, MSLP)
-        self.times = sorted(set(self.glo_rain) & set(self.glo_mslp))
-        if not self.times:
-            raise SystemExit(f"No Global rain/MSLP in {self.glo_run}")
-        if args.valid:
-            start = _stamp(args.valid)
-        else:
-            both = [t for t in self.times if t in self.ukv_rain]
-            start = both[0] if both else self.times[0]
-        if start not in self.times:
-            raise SystemExit(f"No Global data valid {args.valid}")
-        self.i = self.times.index(start)
-
-        ukv_files = list(self.ukv_rain.values()) or list(
-            self.ukv_mslp.values())
-        self.ugrid = UkvGrid(ukv_files[0]) if ukv_files else None
-        self.grid = GlobalGrid(self.glo_rain[self.times[0]],
-                               AREAS[args.area])
-        self.visible = {name: True for name in LAYERS}
-        self.isobar_actors = {"Global MSLP": [], "UKV MSLP": []}
-        # Every hour is prepared in the background, nearest to the
-        # shown hour first, so stepping only swaps in ready data.
-        # Prepared hours are also saved, so reopening a run is quick.
-        self.cache = {}
-        self.claimed = set()
-        self.cache_lock = threading.Lock()
-        self.disk = os.path.join(
-            CACHE, f"v{CACHE_VERSION}_{self.glo_run}_{self.ukv_run}"
-                   f"_{args.area}")
-        os.makedirs(self.disk, exist_ok=True)
-        os.utime(self.disk)                     # newest for pruning
-        _prune_cache()
-
-        pl = self.pl = gv.GeoPlotter(off_screen=bool(args.screenshot),
-                                     window_size=(1400, 1000))
-        pl.set_background("#0b1020")
-        texture = (gv.natural_earth_1() if args.base == "colour"
-                   else grey_texture())
-        pl.add_base_layer(texture=texture, zlevel=0)
-        common = dict(scalars="rain", cmap=COLOURS, clim=(0, len(LEVELS)),
-                      nan_opacity=0.0, show_scalar_bar=False,
-                      n_colors=len(LEVELS))
-        # GeoVista draws a copy of each mesh: keep the drawn one, so a
-        # new time step changes what is on screen. Opaque: see-through
-        # layers make every frame sort millions of cells.
-        self.rain_actors = {
-            "Global rain": pl.add_mesh(self.grid.mesh(), zlevel=2, **common)}
-        if self.ugrid is not None:
-            self.rain_actors["UKV rain"] = pl.add_mesh(
-                self.ugrid.mesh(), zlevel=4, **common)
-        pl.add_coastlines(color="black", line_width=1, zlevel=8)
-        pl.add_legend([(f">={v:g} mm", c) for v, c in zip(LEVELS, COLOURS)],
-                      bcolor="#0b1020", face="rectangle",
-                      size=(0.11, 0.2), loc="lower right")
-        pl.add_text(KEY_HELP, position="lower_left", font_size=9,
-                    color="#c8c8c8", name="keys")
-        self._add_buttons()
-
-        lon, lat, zoom = ATLANTIC if args.view == "atlantic" else HOME
-        self.go_to(lon, lat, zoom)
-        self.home = pl.camera_position
-        # Terrain style turns the globe about its axis and tilts it,
-        # never rolls it: north stays up while dragging.
-        pl.enable_terrain_style(mouse_wheel_zooms=True, shift_pans=True)
-        # PyVista zooms on Up/Down by default; those keys step time here.
-        for key in ("Up", "Down"):
-            pl.clear_events_for_key(key)
-        for key, hours in (("Right", 1), ("Left", -1), ("Up", 6),
-                           ("Down", -6), ("Prior", 6), ("Next", -6)):
-            pl.add_key_event(key, lambda h=hours: self.step(h))
-        pl.add_key_event("h", self.go_home)
-        pl.add_key_event("n", self.north_up)
-        self.show_time()
-        if not args.screenshot:
-            # Two workers: file reading takes turns, the rest overlaps.
-            for _ in range(2):
-                threading.Thread(target=self._prepare_all,
-                                 daemon=True).start()
-
-    # ---- layer buttons ----
-    def _add_buttons(self):
-        self.buttons = {}
-        top = 1000 - 140
-        for k, (name, colour) in enumerate(LAYERS.items()):
-            y = top - k * 40
-            available = name != "UKV rain" or "UKV rain" in self.rain_actors
-            self.buttons[name] = self.pl.add_checkbox_button_widget(
-                lambda on, n=name: self.set_visible(n, on),
-                value=available, position=(10, y), size=28,
-                color_on=colour, color_off="#555555",
-                background_color="#c8c8c8")
-            self.pl.add_text(name, position=(46, y + 4), font_size=10,
-                             color="white", name=f"button {name}")
-            self.visible[name] = available
-
-    def set_visible(self, name, on):
-        self.visible[name] = bool(on)
-        rep = self.buttons[name].GetRepresentation()
-        if rep.GetState() != int(bool(on)):        # set from the keyboard
-            rep.SetState(int(bool(on)))
-        if name in self.rain_actors:
-            self.rain_actors[name].SetVisibility(bool(on))
-        for actor in self.isobar_actors.get(name, []):
-            actor.SetVisibility(bool(on))
-        self.pl.render()
-
-    # ---- view ----
-    def go_to(self, lon, lat, zoom):
-        self.pl.view_poi(x=lon, y=lat)
-        self.pl.camera.zoom(zoom)
-        self.north_up(render=False)
-
-    def go_home(self):
-        self.pl.camera_position = self.home
-        self.pl.render()
-
-    def north_up(self, render=True):
-        cam = self.pl.camera
-        cam.up = (0.0, 0.0, 1.0)
-        cam.OrthogonalizeViewUp()
-        if render:
-            self.pl.render()
-
-    # ---- time ----
-    def step(self, n, render=True):
-        self.i = int(np.clip(self.i + n, 0, len(self.times) - 1))
-        self.show_time()
-        if render:
-            self.pl.render()
-
-    def _prepare(self, t):
-        """Everything one hour needs on screen, from the raw values."""
-        saved = os.path.join(self.disk, f"{t:%Y%m%dT%H%MZ}.npz")
-        try:
-            ready = _load_hour(saved)
-        except (OSError, KeyError, ValueError):
-            ready = self._compute(t)
-            try:
-                _save_hour(saved, ready)
-            except OSError as exc:
-                print("Could not save", saved, exc)
-        with self.cache_lock:
-            self.cache[t] = ready
-        return ready
-
-    def _compute(self, t):
-        g, u = self.grid, self.ugrid
-        ready = {"glo": _classes(g.cut(_values(self.glo_rain[t], RAIN_VAR,
-                                               1000.0))),
-                 "ukv": None, "UKV MSLP": (None, (None, []))}
-        if u is not None and t in self.ukv_rain:
-            ready["ukv"] = _classes(_values(self.ukv_rain[t], RAIN_VAR,
-                                            1000.0))
-        iso = isobar_mesh(g.lon, g.lat,
-                          g.cut(_values(self.glo_mslp[t], MSLP_VAR, 0.01)),
-                          wrap=g.world)
-        ready["Global MSLP"] = (iso, isobar_labels(iso))
-        if u is not None and t in self.ukv_mslp:
-            iso = isobar_mesh(u.x, u.y,
-                              _values(self.ukv_mslp[t], MSLP_VAR, 0.01),
-                              to_lonlat=u.transform)
-            ready["UKV MSLP"] = (iso, isobar_labels(iso))
-        return ready
-
-    def _prepare_all(self):
-        while True:
-            with self.cache_lock:
-                todo = [k for k in range(len(self.times))
-                        if self.times[k] not in self.cache
-                        and self.times[k] not in self.claimed]
-                if not todo:
-                    return
-                k = min(todo, key=lambda k: (abs(k - self.i), k < self.i))
-                self.claimed.add(self.times[k])
-            try:
-                self._prepare(self.times[k])
-            except Exception as exc:            # keep the window usable
-                print("Could not prepare", self.times[k], exc)
-                return
-
-    def show_time(self):
-        pl, t = self.pl, self.times[self.i]
-        with self.cache_lock:
-            ready = self.cache.get(t)
-        if ready is None:
-            ready = self._prepare(t)
-        glo = self.rain_actors["Global rain"].mapper.dataset
-        glo.cell_data["rain"] = _shown(ready["glo"])
-        ukv_text = "UKV: no data"
-        if "UKV rain" in self.rain_actors:
-            ukv = self.rain_actors["UKV rain"].mapper.dataset
-            if ready["ukv"] is not None:
-                ukv.cell_data["rain"] = _shown(ready["ukv"])
-                ukv_text = f"UKV {self.ukv_run} T+{self._lead(t, self.ukv_run)}"
-            else:
-                ukv.cell_data["rain"][:] = np.nan
-                ukv.Modified()
-
-        for name, actors in self.isobar_actors.items():
-            for actor in actors:
-                pl.remove_actor(actor, render=False)
-            actors.clear()
-            iso, (pts, labels) = ready[name]
-            colour = ISOBAR_COLOUR[name]
-            if iso is not None and iso.n_points:
-                actors.append(pl.add_mesh(
-                    iso, color=colour, line_width=1.5,
-                    zlevel=6 if name == "Global MSLP" else 7))
-            if pts is not None:
-                actors.append(pl.add_point_labels(
-                    pts, labels, font_size=11, text_color=colour,
-                    shape=None, show_points=False, always_visible=False,
-                    render=False))
-            for actor in actors:
-                actor.SetVisibility(self.visible[name])
-
-        pl.add_text(f"Valid {t:%a %d %b %H:%M} UTC: hourly rainfall, "
-                    "MSLP every 4 hPa\n"
-                    f"{ukv_text} (on top), Global {self.glo_run} "
-                    f"T+{self._lead(t, self.glo_run)}\n"
-                    "Native model cells, no resampling. Prototype.",
-                    position="upper_left", font_size=10, color="white",
-                    name="title")
-
-    @staticmethod
-    def _lead(t, run):
-        return int((t - _stamp(run)) / timedelta(hours=1))
+def run_screenshot(args):
+    import geovista as gv
+    pl = gv.GeoPlotter(off_screen=True, window_size=(1400, 1000))
+    scene = core.Scene(pl, ukv_run=args.ukv_run, global_run=args.global_run,
+                       valid=args.valid, area=args.area, base=args.base,
+                       view=args.view)
+    for name in args.show:
+        scene.set_visible(name, True, render=False)
+    for name in args.hide:
+        scene.set_visible(name, False, render=False)
+    if args.steps:
+        scene.step(args.steps, render=False)
+    pl.show(screenshot=args.screenshot)
+    print("wrote", args.screenshot, "valid", scene.time)
 
 
 def main():
-    global ARCHIVE
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--archive", default=ARCHIVE,
+    ap.add_argument("--archive", default=core.ARCHIVE,
                     help="download archive folder (default: %(default)s)")
     ap.add_argument("--ukv-run", help="default: newest in the archive")
     ap.add_argument("--global-run", help="default: newest in the archive")
     ap.add_argument("--valid", help="start time, e.g. 20261116T0300Z "
                     "(default: first hour both models cover)")
     ap.add_argument("--base", choices=["grey", "colour"], default="grey")
-    ap.add_argument("--area", choices=sorted(AREAS), default="atlantic",
+    ap.add_argument("--area", choices=sorted(core.AREAS), default="atlantic",
                     help="Global area drawn (default: %(default)s)")
     ap.add_argument("--view", choices=["ireland", "atlantic"],
                     default="ireland")
-    ap.add_argument("--hide", nargs="*", default=[], choices=sorted(LAYERS),
-                    metavar="LAYER", help="layers to start switched off "
-                    f"(any of: {', '.join(LAYERS)})")
+    ap.add_argument("--screenshot", help="testing: draw off screen, write "
+                    "a PNG of the globe and exit")
+    ap.add_argument("--show", nargs="*", default=[], choices=list(LAYERS),
+                    metavar="LAYER", help="with --screenshot: layers on")
+    ap.add_argument("--hide", nargs="*", default=[], choices=list(LAYERS),
+                    metavar="LAYER", help="with --screenshot: layers off")
     ap.add_argument("--steps", type=int, default=0,
-                    help="hours to step before a screenshot (testing)")
-    ap.add_argument("--screenshot", help="write a PNG and exit")
+                    help="with --screenshot: hours to step first")
+    ap.add_argument("--smoke", help="testing: open the window, save a "
+                    "picture of it and close")
+    ap.add_argument("--smoke-wait", type=int, default=8,
+                    help="seconds before --smoke saves (default 8)")
     args = ap.parse_args()
-    ARCHIVE = args.archive
-
-    g = Globe(args)
-    for name in args.hide:
-        g.set_visible(name, False)
-    if args.steps:
-        g.step(args.steps, render=False)
+    core.ARCHIVE = args.archive
     if args.screenshot:
-        g.pl.show(screenshot=args.screenshot)
-        print("wrote", args.screenshot, "valid", g.times[g.i])
-    else:
-        g.pl.show()
+        run_screenshot(args)
+        return 0
+    return run_window(args)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
