@@ -42,7 +42,10 @@ zoom, Shift+drag to pan.
 | `--screenshot FILE` | Write a PNG and exit (`--steps N` steps N hours first) |
 
 Times step through the Global run's hours; UKV is shown for the hours
-its run covers. Isobars (Global MSLP, every 4 hPa) are labelled about
+its run covers. Once the window is open every hour is prepared in the
+background, nearest hours first (about 0.7 s each, so a 54-hour run is
+ready after roughly 40 s); a prepared hour appears at once. All hours
+together take roughly 0.5-0.6 GB of memory. Isobars (Global MSLP, every 4 hPa) are labelled about
 every 750 km.
 
 The archive layout is `<archive>/<model>/<run>/<parameter>/*.nc`, as

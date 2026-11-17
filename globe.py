@@ -20,11 +20,13 @@ up), n north up from the current view. Dragging keeps north up.
 from __future__ import annotations
 
 import argparse
-import functools
 import glob
 import os
+import threading
+import warnings
 from datetime import datetime, timedelta
 
+import contourpy
 import geovista as gv
 import numpy as np
 import pyvista as pv
@@ -69,19 +71,69 @@ def _latest_run(model):
     return runs[-1]
 
 
-@functools.lru_cache(maxsize=6)
+# Isobar points are made on the globe already, so GeoVista's "no CRS"
+# warning for them means nothing.
+warnings.filterwarnings("ignore", message="geovista found no coordinate")
+# NetCDF/HDF5 reading is not safe from two threads at once.
+READ_LOCK = threading.Lock()
+DRY = 255                           # class code: dry or missing
+
+
 def _values(path, name, scale):
     """Raw values from one file (scaled to mm or hPa only)."""
-    with xr.open_dataset(path) as ds:
+    with READ_LOCK, xr.open_dataset(path) as ds:
         return ds[name].values * scale
 
 
 def _classes(mm):
-    """mm -> colour class index; dry and missing cells become NaN so
-    they are see-through (the value itself is not changed)."""
-    out = np.digitize(mm, LEVELS).astype(float) - 1
-    out[~np.isfinite(mm) | (mm < LEVELS[0])] = np.nan
+    """mm -> colour class 0..6 as bytes, DRY for dry and missing cells
+    (stored small so every hour can be kept in memory)."""
+    out = (np.digitize(mm, LEVELS) - 1).astype(np.uint8)
+    out[~np.isfinite(mm) | (mm < LEVELS[0])] = DRY
+    return out.ravel()
+
+
+def _shown(classes):
+    """Class bytes -> what the mesh draws; DRY becomes see-through."""
+    out = classes.astype(np.float32)
+    out[classes == DRY] = np.nan
     return out
+
+
+def _xyz(lon, lat):
+    """Longitude/latitude -> points on GeoVista's unit globe."""
+    lam, phi = np.radians(lon), np.radians(lat)
+    return np.column_stack([np.cos(phi) * np.cos(lam),
+                            np.cos(phi) * np.sin(lam),
+                            np.sin(phi)]).astype(np.float32)
+
+
+def isobar_mesh(lon, lat, hpa):
+    """Isobars from the Global MSLP field as lines on the globe.
+
+    contourpy on the 2D grid is about six times faster than VTK
+    contouring the globe mesh. The first column is repeated at the end
+    so lines close across the 0/360 seam."""
+    lon = np.append(lon, lon[0] + 360.0)
+    hpa = np.column_stack([hpa, hpa[:, 0]])
+    gen = contourpy.contour_generator(lon, lat, hpa, line_type="Separate")
+    pts, cells, vals, n = [], [], [], 0
+    for level in ISOBARS:
+        for line in gen.lines(level):
+            if len(line) < 2:
+                continue
+            pts.append(line)
+            cells.append(np.concatenate([[len(line)],
+                                         np.arange(n, n + len(line))]))
+            vals.append(np.full(len(line), level, dtype=np.float32))
+            n += len(line)
+    if not pts:
+        return pv.PolyData()
+    xy = np.concatenate(pts)
+    mesh = pv.PolyData(_xyz(xy[:, 0], xy[:, 1]),
+                       lines=np.concatenate(cells))
+    mesh.point_data["hPa"] = np.concatenate(vals)
+    return mesh
 
 
 def ukv_mesh(path):
@@ -163,8 +215,14 @@ class Globe:
         self.ukv = ukv_mesh(next(iter(self.ukv_rain.values()))) \
             if self.ukv_rain else None
         self.glo = global_mesh(self.glo_rain[self.times[0]])
-        self.pres = global_mesh(self.glo_mslp[self.times[0]])
+        with xr.open_dataset(self.glo_mslp[self.times[0]]) as ds:
+            self.lon = ds["longitude"].values
+            self.lat = ds["latitude"].values
         self.dynamic = []
+        # Every hour is prepared in the background, nearest to the
+        # shown hour first, so stepping only swaps in ready data.
+        self.cache = {}
+        self.cache_lock = threading.Lock()
 
         pl = self.pl = gv.GeoPlotter(off_screen=bool(args.screenshot),
                                      window_size=(1400, 1000))
@@ -202,6 +260,8 @@ class Globe:
         pl.add_key_event("h", self.go_home)
         pl.add_key_event("n", self.north_up)
         self.show_time()
+        if not args.screenshot:
+            threading.Thread(target=self._prepare_all, daemon=True).start()
 
     # ---- view ----
     def go_to(self, lon, lat, zoom):
@@ -227,31 +287,62 @@ class Globe:
         if render:
             self.pl.render()
 
+    def _prepare(self, t):
+        """Everything one hour needs on screen, from the raw values."""
+        glo = _classes(_values(self.glo_rain[t],
+                               "lwe_thickness_of_precipitation_amount",
+                               1000.0))
+        ukv = None
+        if self.ukv is not None and t in self.ukv_rain:
+            ukv = _classes(_values(self.ukv_rain[t],
+                                   "lwe_thickness_of_precipitation_amount",
+                                   1000.0))
+        hpa = _values(self.glo_mslp[t], "air_pressure_at_sea_level", 0.01)
+        isobars = isobar_mesh(self.lon, self.lat, hpa)
+        ready = dict(glo=glo, ukv=ukv, isobars=isobars,
+                     labels=isobar_labels(isobars))
+        with self.cache_lock:
+            self.cache[t] = ready
+        return ready
+
+    def _prepare_all(self):
+        while True:
+            with self.cache_lock:
+                todo = [k for k in range(len(self.times))
+                        if self.times[k] not in self.cache]
+            if not todo:
+                return
+            k = min(todo, key=lambda k: (abs(k - self.i), k < self.i))
+            try:
+                self._prepare(self.times[k])
+            except Exception as exc:            # keep the window usable
+                print("Could not prepare", self.times[k], exc)
+                return
+
     def show_time(self):
         pl, t = self.pl, self.times[self.i]
-        mm = _values(self.glo_rain[t],
-                     "lwe_thickness_of_precipitation_amount", 1000.0)
-        self.glo.cell_data["rain"] = _classes(mm).ravel()
+        with self.cache_lock:
+            ready = self.cache.get(t)
+        if ready is None:
+            ready = self._prepare(t)
+        self.glo.cell_data["rain"] = _shown(ready["glo"])
         ukv_text = "UKV: no data"
         if self.ukv is not None:
-            if t in self.ukv_rain:
-                mm = _values(self.ukv_rain[t],
-                             "lwe_thickness_of_precipitation_amount", 1000.0)
-                self.ukv.cell_data["rain"] = _classes(mm).ravel()
+            if ready["ukv"] is not None:
+                self.ukv.cell_data["rain"] = _shown(ready["ukv"])
                 ukv_text = f"UKV {self.ukv_run} T+{self._lead(t, self.ukv_run)}"
             else:
                 self.ukv.cell_data["rain"][:] = np.nan
                 self.ukv.Modified()
 
-        hpa = _values(self.glo_mslp[t], "air_pressure_at_sea_level", 0.01)
-        self.pres.cell_data["hPa"] = hpa.ravel()
-        isobars = self.pres.cell_data_to_point_data().contour(
-            isosurfaces=ISOBARS, scalars="hPa")
+        isobars = ready["isobars"]
         for actor in self.dynamic:
             pl.remove_actor(actor, render=False)
-        self.dynamic = [pl.add_mesh(isobars, color="#1a1a1a",
-                                    line_width=1.5, zlevel=6)]
-        pts, labels = isobar_labels(isobars)
+        self.dynamic = []
+        if isobars.n_points:
+            self.dynamic.append(pl.add_mesh(isobars, color="#1a1a1a",
+                                            line_width=1.5, zlevel=6))
+        pts, labels = ready["labels"]
         if pts is not None:
             self.dynamic.append(pl.add_point_labels(
                 pts, labels, font_size=11, text_color="#1a1a1a",
