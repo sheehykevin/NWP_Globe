@@ -2,7 +2,7 @@
 
 A 3D globe for Met Office model output, for the larger-domain models
 where a flat map distorts. Prototype: rainfall from UKV (on top) and the
-Global 10 km model, with Global MSLP isobars, on one globe you can spin
+Global 10 km model, with MSLP isobars from both, on one globe you can spin
 and zoom. It does not replace the flat viewer in the UKMO NWP tools.
 
 ![North Atlantic](docs/screenshots/globe_atlantic.png)
@@ -27,10 +27,14 @@ zoom, Shift+drag to pan.
 | Key | Action |
 |---|---|
 | Right / Left | Next / previous hour |
-| Up / Down | Six hours on / back |
+| Up / Down (or Page Up / Page Down) | Six hours on / back |
 | h | Home: the Ireland view, north up |
 | n | North up from the current view |
 | q | Quit |
+
+Buttons at the top left switch each layer on and off: Global rain, UKV
+rain, Global MSLP (black isobars) and UKV MSLP (blue isobars, UKV area
+only).
 
 | Option | Meaning |
 |---|---|
@@ -40,6 +44,7 @@ zoom, Shift+drag to pan.
 | `--base grey` / `colour` | Background: Natural Earth I shaded relief in grey (default) or in colour |
 | `--area atlantic` / `world` | Global area drawn (default `atlantic`) |
 | `--view ireland` / `atlantic` | Starting view |
+| `--hide LAYER ...` | Layers to start switched off, e.g. `--hide "Global MSLP"` |
 | `--screenshot FILE` | Write a PNG and exit (`--steps N` steps N hours first) |
 
 Times step through the Global run's hours; UKV is shown for the hours
@@ -55,14 +60,16 @@ reopening a run is quick. Measured on a 54-hour run:
 
 | | `atlantic` | `world` |
 |---|---|---|
-| All hours ready, first opening | 11 s | 31 s |
+| All hours ready, first opening | 16 s | 37 s |
 | All hours ready, reopening | 0.3 s | 0.6 s |
-| One step | 0.01 s | 0.06 s |
-| Memory for all hours | 0.12 GB | 0.56 GB |
-| Disk cache per run | 117 MB | 565 MB |
+| One step | 0.02 s | 0.06 s |
+| Memory for all hours | 0.13 GB | 0.58 GB |
+| Disk cache per run | 134 MB | 582 MB |
 
-The grey background is made once and saved in `cache\`. Isobars (Global MSLP, every 4 hPa) are labelled about
-every 750 km.
+The grey background is made once and saved in `cache\`. Isobars are
+every 4 hPa, contoured on each model's own grid and labelled about every
+750 km. UKV MSLP over high ground shows small closed loops, as in the
+model field.
 
 The archive layout is `<archive>/<model>/<run>/<parameter>/*.nc`, as
 written by the UKMO NWP tools.

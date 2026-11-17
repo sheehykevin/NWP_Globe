@@ -1,4 +1,4 @@
-"""3D globe: UKV and Global rainfall on one globe (prototype).
+"""3D globe: UKV and Global rainfall and MSLP on one globe (prototype).
 
 Reads the download archive written by the UKMO NWP tools
 (<archive>/ukv/<run>/<parameter>/*.nc, <archive>/global10km/...).
@@ -11,10 +11,11 @@ from the file's cell bounds (UKV in its Lambert equal-area metres
 turned into longitude/latitude by pyproj, Global straight from its
 latitude/longitude bounds). Nothing is resampled; the value on a cell is
 the value in the file. UKV sits on top of Global where the two overlap.
-Global MSLP is drawn as labelled isobars.
+MSLP from each model is drawn as labelled isobars.
 
-Keys: Left/Right one hour, Down/Up six hours, h home (Ireland, north
-up), n north up from the current view. Dragging keeps north up.
+Keys: Left/Right one hour, Up/Down (or Page Up/Page Down) six hours,
+h home (Ireland, north up), n north up from the current view. Dragging
+keeps north up. Buttons on the left switch each layer on and off.
 """
 
 from __future__ import annotations
@@ -40,22 +41,35 @@ ARCHIVE = os.path.normpath(os.path.join(HERE, "..", "ukmo_nwp", "data",
                                         "archive"))
 RAIN = "precipitation_accumulation"
 MSLP = "pressure_at_mean_sea_level"
+RAIN_VAR = "lwe_thickness_of_precipitation_amount"
+MSLP_VAR = "air_pressure_at_sea_level"
 # Rainfall colour steps (mm in the hour), roughly as on the pages.
 LEVELS = [0.1, 0.5, 1, 2, 4, 8, 16]
 # Radar-style colours; they stand out on the grey base.
 COLOURS = ["#9be564", "#2fb344", "#fde725", "#fd9a2a", "#e8322a",
            "#c51b8a", "#7a0177"]
 ISOBARS = np.arange(940, 1061, 4)
+# Layers the buttons switch, with the colour of their button / lines.
+LAYERS = {"Global rain": "#2fb344", "UKV rain": "#9be564",
+          "Global MSLP": "#1a1a1a", "UKV MSLP": "#1f4fbf"}
+ISOBAR_COLOUR = {"Global MSLP": "#1a1a1a", "UKV MSLP": "#1f4fbf"}
 HOME = (-8.0, 53.4, 7.0)            # lon, lat, zoom
 ATLANTIC = (-15.0, 52.0, 2.4)
 # Global area drawn: (west, east, south, north) in degrees, or None for
 # the whole world. A block of the native cells, never resampled.
 AREAS = {"atlantic": (-80.0, 50.0, 15.0, 80.0), "world": None}
 CACHE = os.path.join(HERE, "cache")
-CACHE_VERSION = 1                   # bump when prepared data changes
+CACHE_VERSION = 2                   # bump when prepared data changes
 KEEP_CACHED_RUNS = 6
-KEY_HELP = ("Left/Right: hour   Down/Up: 6 hours   "
+KEY_HELP = ("Left/Right: hour   Up/Down: 6 hours   "
             "h: home   n: north up   q: quit")
+
+# Isobar points are made on the globe already, so GeoVista's "no CRS"
+# warning for them means nothing.
+warnings.filterwarnings("ignore", message="geovista found no coordinate")
+# NetCDF/HDF5 reading is not safe from two threads at once.
+READ_LOCK = threading.Lock()
+DRY = 255                           # class code: dry or missing
 
 
 def _stamp(text):
@@ -76,14 +90,6 @@ def _latest_run(model):
     if not runs:
         raise SystemExit(f"No {model} runs in {ARCHIVE}")
     return runs[-1]
-
-
-# Isobar points are made on the globe already, so GeoVista's "no CRS"
-# warning for them means nothing.
-warnings.filterwarnings("ignore", message="geovista found no coordinate")
-# NetCDF/HDF5 reading is not safe from two threads at once.
-READ_LOCK = threading.Lock()
-DRY = 255                           # class code: dry or missing
 
 
 def _values(path, name, scale):
@@ -115,16 +121,18 @@ def _xyz(lon, lat):
                             np.sin(phi)]).astype(np.float32)
 
 
-def isobar_mesh(lon, lat, hpa, world=True):
-    """Isobars from the Global MSLP field as lines on the globe.
+def isobar_mesh(x, y, hpa, to_lonlat=None, wrap=False):
+    """Isobars as lines on the globe, contoured on the model's own grid.
 
-    contourpy on the 2D grid is about six times faster than VTK
-    contouring the globe mesh. The first column is repeated at the end
-    so lines close across the date line (whole world only)."""
-    if world:
-        lon = np.append(lon, lon[0] + 360.0)
+    ``x``/``y`` are the cell centres (degrees, or projection metres with
+    ``to_lonlat`` turning line points into longitude/latitude). contourpy
+    on the 2D grid is about six times faster than VTK contouring the
+    globe mesh. With ``wrap`` the first column is repeated at the end so
+    lines close across the date line (whole-world Global)."""
+    if wrap:
+        x = np.append(x, x[0] + 360.0)
         hpa = np.column_stack([hpa, hpa[:, 0]])
-    gen = contourpy.contour_generator(lon, lat, hpa, line_type="Separate")
+    gen = contourpy.contour_generator(x, y, hpa, line_type="Separate")
     pts, cells, vals, n = [], [], [], 0
     for level in ISOBARS:
         for line in gen.lines(level):
@@ -138,26 +146,56 @@ def isobar_mesh(lon, lat, hpa, world=True):
     if not pts:
         return pv.PolyData()
     xy = np.concatenate(pts)
-    mesh = pv.PolyData(_xyz(xy[:, 0], xy[:, 1]),
-                       lines=np.concatenate(cells))
+    lon, lat = (to_lonlat(xy[:, 0], xy[:, 1]) if to_lonlat
+                else (xy[:, 0], xy[:, 1]))
+    mesh = pv.PolyData(_xyz(lon, lat), lines=np.concatenate(cells))
     mesh.point_data["hPa"] = np.concatenate(vals)
     return mesh
 
 
-def ukv_mesh(path):
-    with xr.open_dataset(path) as ds:
-        var = ds["lwe_thickness_of_precipitation_amount"]
-        crs = CRS.from_cf(ds[var.attrs["grid_mapping"]].attrs)
-        xb = ds["projection_x_coordinate_bnds"].values
-        yb = ds["projection_y_coordinate_bnds"].values
-        shape = var.shape
-    xe = np.append(xb[:, 0], xb[-1, 1])
-    ye = np.append(yb[:, 0], yb[-1, 1])
-    xx, yy = np.meshgrid(xe, ye)
-    lon, lat = Transformer.from_crs(crs, "EPSG:4326",
-                                    always_xy=True).transform(xx, yy)
-    return gv.Transform.from_2d(lon, lat, data=np.full(shape, np.nan),
-                                name="rain")
+def isobar_labels(isobars, spacing=0.12):
+    """Isobar values at points along the lines, about one per
+    ``spacing``-sized box (globe radii; 0.12 is about 750 km), lifted
+    just off the globe so the layers under them do not hide them."""
+    if isobars.n_points == 0:
+        return None, []
+    xyz = isobars.points
+    hpa = isobars.point_data["hPa"]
+    # One label per box and isobar value: the point nearest the box
+    # centre, so labels sit where the line crosses the box middle.
+    box = np.floor(xyz / spacing).astype(np.int64)
+    off = np.sum((xyz / spacing - box - 0.5) ** 2, axis=1)
+    key = np.column_stack([box, np.rint(hpa).astype(np.int64)])
+    order = np.lexsort((off, *key.T[::-1]))
+    _, first = np.unique(key[order], axis=0, return_index=True)
+    kept = order[first]
+    # Boxes in a chequerboard only, so neighbours' labels do not touch.
+    kept = kept[np.sum(box[kept], axis=1) % 2 == 0]
+    return xyz[kept] * 1.004, [f"{hpa[i]:.0f}" for i in kept]
+
+
+class UkvGrid:
+    """The UKV grid: cell corners on the globe and its projection."""
+
+    def __init__(self, path):
+        with xr.open_dataset(path) as ds:
+            var = ds[RAIN_VAR] if RAIN_VAR in ds else ds[MSLP_VAR]
+            crs = CRS.from_cf(ds[var.attrs["grid_mapping"]].attrs)
+            xb = ds["projection_x_coordinate_bnds"].values
+            yb = ds["projection_y_coordinate_bnds"].values
+            self.x = ds["projection_x_coordinate"].values
+            self.y = ds["projection_y_coordinate"].values
+        self.transform = Transformer.from_crs(crs, "EPSG:4326",
+                                              always_xy=True).transform
+        self.x_edges = np.append(xb[:, 0], xb[-1, 1])
+        self.y_edges = np.append(yb[:, 0], yb[-1, 1])
+
+    def mesh(self):
+        xx, yy = np.meshgrid(self.x_edges, self.y_edges)
+        lon, lat = self.transform(xx, yy)
+        shape = (self.y.size, self.x.size)
+        return gv.Transform.from_2d(lon, lat, data=np.full(shape, np.nan),
+                                    name="rain")
 
 
 class GlobalGrid:
@@ -196,7 +234,7 @@ class GlobalGrid:
 
 def grey_texture():
     """Natural Earth I shaded relief, in light grey so coloured
-    forecast layers stand out."""
+    forecast layers stand out. Made once and saved."""
     saved = os.path.join(CACHE, "grey_base.npy")
     try:
         return pv.Texture(np.load(saved))
@@ -211,19 +249,38 @@ def grey_texture():
     return pv.Texture(image)
 
 
+# ---- prepared hours on disk -------------------------------------------
+
+def _pack_isobars(prefix, iso, labels, out):
+    pts, txt = labels
+    out[f"{prefix}_points"] = np.asarray(iso.points, dtype=np.float32)
+    out[f"{prefix}_lines"] = np.asarray(iso.lines, dtype=np.int32)
+    out[f"{prefix}_hpa"] = np.asarray(iso.point_data.get("hPa", []),
+                                      dtype=np.float32)
+    out[f"{prefix}_label_pts"] = (np.zeros((0, 3), np.float32)
+                                  if pts is None else pts.astype(np.float32))
+    out[f"{prefix}_label_txt"] = np.array(txt, dtype="U8")
+
+
+def _unpack_isobars(prefix, f):
+    if f"{prefix}_points" not in f:
+        return None, (None, [])
+    iso = pv.PolyData()
+    if f[f"{prefix}_points"].size:
+        iso = pv.PolyData(f[f"{prefix}_points"], lines=f[f"{prefix}_lines"])
+        iso.point_data["hPa"] = f[f"{prefix}_hpa"]
+    pts = f[f"{prefix}_label_pts"]
+    return iso, (pts if len(pts) else None, list(f[f"{prefix}_label_txt"]))
+
+
 def _save_hour(path, ready):
-    iso = ready["isobars"]
-    pts, labels = ready["labels"]
-    arrays = dict(glo=ready["glo"],
-                  points=np.asarray(iso.points, dtype=np.float32),
-                  lines=np.asarray(iso.lines, dtype=np.int32),
-                  hpa=np.asarray(iso.point_data.get("hPa", []),
-                                 dtype=np.float32),
-                  label_pts=(np.zeros((0, 3), np.float32) if pts is None
-                             else pts.astype(np.float32)),
-                  label_txt=np.array(labels, dtype="U8"))
+    arrays = dict(glo=ready["glo"])
     if ready["ukv"] is not None:
         arrays["ukv"] = ready["ukv"]
+    for prefix, key in (("g", "Global MSLP"), ("u", "UKV MSLP")):
+        iso, labels = ready[key]
+        if iso is not None:
+            _pack_isobars(prefix, iso, labels, arrays)
     tmp = path + ".part.npz"
     np.savez(tmp, **arrays)
     os.replace(tmp, path)
@@ -231,15 +288,10 @@ def _save_hour(path, ready):
 
 def _load_hour(path):
     with np.load(path) as f:
-        iso = pv.PolyData()
-        if f["points"].size:
-            iso = pv.PolyData(f["points"], lines=f["lines"])
-            iso.point_data["hPa"] = f["hpa"]
-        pts = f["label_pts"]
-        return dict(glo=f["glo"], ukv=f["ukv"] if "ukv" in f else None,
-                    isobars=iso,
-                    labels=(pts if len(pts) else None,
-                            list(f["label_txt"])))
+        return {"glo": f["glo"],
+                "ukv": f["ukv"] if "ukv" in f else None,
+                "Global MSLP": _unpack_isobars("g", f),
+                "UKV MSLP": _unpack_isobars("u", f)}
 
 
 def _prune_cache():
@@ -253,32 +305,12 @@ def _prune_cache():
         shutil.rmtree(d.path, ignore_errors=True)
 
 
-def isobar_labels(isobars, spacing=0.12):
-    """Isobar values at points along the lines, about one per
-    ``spacing``-sized box (globe radii; 0.12 is about 750 km), lifted
-    just off the globe so the layers under them do not hide them."""
-    if isobars.n_points == 0:
-        return None, []
-    xyz = isobars.points
-    hpa = isobars.point_data["hPa"]
-    # One label per box and isobar value: the point nearest the box
-    # centre, so labels sit where the line crosses the box middle.
-    box = np.floor(xyz / spacing).astype(np.int64)
-    off = np.sum((xyz / spacing - box - 0.5) ** 2, axis=1)
-    key = np.column_stack([box, np.rint(hpa).astype(np.int64)])
-    order = np.lexsort((off, *key.T[::-1]))
-    _, first = np.unique(key[order], axis=0, return_index=True)
-    kept = order[first]
-    # Boxes in a chequerboard only, so neighbours' labels do not touch.
-    kept = kept[np.sum(box[kept], axis=1) % 2 == 0]
-    return xyz[kept] * 1.004, [f"{hpa[i]:.0f}" for i in kept]
-
-
 class Globe:
     def __init__(self, args):
         self.ukv_run = args.ukv_run or _latest_run("ukv")
         self.glo_run = args.global_run or _latest_run("global10km")
         self.ukv_rain = _index("ukv", self.ukv_run, RAIN)
+        self.ukv_mslp = _index("ukv", self.ukv_run, MSLP)
         self.glo_rain = _index("global10km", self.glo_run, RAIN)
         self.glo_mslp = _index("global10km", self.glo_run, MSLP)
         self.times = sorted(set(self.glo_rain) & set(self.glo_mslp))
@@ -293,12 +325,13 @@ class Globe:
             raise SystemExit(f"No Global data valid {args.valid}")
         self.i = self.times.index(start)
 
-        self.ukv = ukv_mesh(next(iter(self.ukv_rain.values()))) \
-            if self.ukv_rain else None
+        ukv_files = list(self.ukv_rain.values()) or list(
+            self.ukv_mslp.values())
+        self.ugrid = UkvGrid(ukv_files[0]) if ukv_files else None
         self.grid = GlobalGrid(self.glo_rain[self.times[0]],
                                AREAS[args.area])
-        self.glo = self.grid.mesh()
-        self.dynamic = []
+        self.visible = {name: True for name in LAYERS}
+        self.isobar_actors = {"Global MSLP": [], "UKV MSLP": []}
         # Every hour is prepared in the background, nearest to the
         # shown hour first, so stepping only swaps in ready data.
         # Prepared hours are also saved, so reopening a run is quick.
@@ -322,19 +355,20 @@ class Globe:
                       nan_opacity=0.0, show_scalar_bar=False,
                       n_colors=len(LEVELS))
         # GeoVista draws a copy of each mesh: keep the drawn one, so a
-        # new time step changes what is on screen.
-        # Opaque: see-through layers make every frame sort millions of
-        # cells, which slows turning the globe.
-        self.glo = pl.add_mesh(self.glo, zlevel=2, **common).mapper.dataset
-        if self.ukv is not None:
-            self.ukv = pl.add_mesh(self.ukv, zlevel=4,
-                                   **common).mapper.dataset
+        # new time step changes what is on screen. Opaque: see-through
+        # layers make every frame sort millions of cells.
+        self.rain_actors = {
+            "Global rain": pl.add_mesh(self.grid.mesh(), zlevel=2, **common)}
+        if self.ugrid is not None:
+            self.rain_actors["UKV rain"] = pl.add_mesh(
+                self.ugrid.mesh(), zlevel=4, **common)
         pl.add_coastlines(color="black", line_width=1, zlevel=8)
         pl.add_legend([(f">={v:g} mm", c) for v, c in zip(LEVELS, COLOURS)],
                       bcolor="#0b1020", face="rectangle",
                       size=(0.11, 0.2), loc="lower right")
         pl.add_text(KEY_HELP, position="lower_left", font_size=9,
                     color="#c8c8c8", name="keys")
+        self._add_buttons()
 
         lon, lat, zoom = ATLANTIC if args.view == "atlantic" else HOME
         self.go_to(lon, lat, zoom)
@@ -342,10 +376,12 @@ class Globe:
         # Terrain style turns the globe about its axis and tilts it,
         # never rolls it: north stays up while dragging.
         pl.enable_terrain_style(mouse_wheel_zooms=True, shift_pans=True)
-        pl.add_key_event("Right", lambda: self.step(1))
-        pl.add_key_event("Left", lambda: self.step(-1))
-        pl.add_key_event("Up", lambda: self.step(6))
-        pl.add_key_event("Down", lambda: self.step(-6))
+        # PyVista zooms on Up/Down by default; those keys step time here.
+        for key in ("Up", "Down"):
+            pl.clear_events_for_key(key)
+        for key, hours in (("Right", 1), ("Left", -1), ("Up", 6),
+                           ("Down", -6), ("Prior", 6), ("Next", -6)):
+            pl.add_key_event(key, lambda h=hours: self.step(h))
         pl.add_key_event("h", self.go_home)
         pl.add_key_event("n", self.north_up)
         self.show_time()
@@ -354,6 +390,33 @@ class Globe:
             for _ in range(2):
                 threading.Thread(target=self._prepare_all,
                                  daemon=True).start()
+
+    # ---- layer buttons ----
+    def _add_buttons(self):
+        self.buttons = {}
+        top = 1000 - 140
+        for k, (name, colour) in enumerate(LAYERS.items()):
+            y = top - k * 40
+            available = name != "UKV rain" or "UKV rain" in self.rain_actors
+            self.buttons[name] = self.pl.add_checkbox_button_widget(
+                lambda on, n=name: self.set_visible(n, on),
+                value=available, position=(10, y), size=28,
+                color_on=colour, color_off="#555555",
+                background_color="#c8c8c8")
+            self.pl.add_text(name, position=(46, y + 4), font_size=10,
+                             color="white", name=f"button {name}")
+            self.visible[name] = available
+
+    def set_visible(self, name, on):
+        self.visible[name] = bool(on)
+        rep = self.buttons[name].GetRepresentation()
+        if rep.GetState() != int(bool(on)):        # set from the keyboard
+            rep.SetState(int(bool(on)))
+        if name in self.rain_actors:
+            self.rain_actors[name].SetVisibility(bool(on))
+        for actor in self.isobar_actors.get(name, []):
+            actor.SetVisibility(bool(on))
+        self.pl.render()
 
     # ---- view ----
     def go_to(self, lon, lat, zoom):
@@ -395,20 +458,23 @@ class Globe:
         return ready
 
     def _compute(self, t):
-        g = self.grid
-        glo = _classes(g.cut(_values(self.glo_rain[t],
-                                     "lwe_thickness_of_precipitation_amount",
-                                     1000.0)))
-        ukv = None
-        if self.ukv is not None and t in self.ukv_rain:
-            ukv = _classes(_values(self.ukv_rain[t],
-                                   "lwe_thickness_of_precipitation_amount",
-                                   1000.0))
-        hpa = g.cut(_values(self.glo_mslp[t], "air_pressure_at_sea_level",
-                            0.01))
-        isobars = isobar_mesh(g.lon, g.lat, hpa, world=g.world)
-        return dict(glo=glo, ukv=ukv, isobars=isobars,
-                    labels=isobar_labels(isobars))
+        g, u = self.grid, self.ugrid
+        ready = {"glo": _classes(g.cut(_values(self.glo_rain[t], RAIN_VAR,
+                                               1000.0))),
+                 "ukv": None, "UKV MSLP": (None, (None, []))}
+        if u is not None and t in self.ukv_rain:
+            ready["ukv"] = _classes(_values(self.ukv_rain[t], RAIN_VAR,
+                                            1000.0))
+        iso = isobar_mesh(g.lon, g.lat,
+                          g.cut(_values(self.glo_mslp[t], MSLP_VAR, 0.01)),
+                          wrap=g.world)
+        ready["Global MSLP"] = (iso, isobar_labels(iso))
+        if u is not None and t in self.ukv_mslp:
+            iso = isobar_mesh(u.x, u.y,
+                              _values(self.ukv_mslp[t], MSLP_VAR, 0.01),
+                              to_lonlat=u.transform)
+            ready["UKV MSLP"] = (iso, isobar_labels(iso))
+        return ready
 
     def _prepare_all(self):
         while True:
@@ -432,34 +498,40 @@ class Globe:
             ready = self.cache.get(t)
         if ready is None:
             ready = self._prepare(t)
-        self.glo.cell_data["rain"] = _shown(ready["glo"])
+        glo = self.rain_actors["Global rain"].mapper.dataset
+        glo.cell_data["rain"] = _shown(ready["glo"])
         ukv_text = "UKV: no data"
-        if self.ukv is not None:
+        if "UKV rain" in self.rain_actors:
+            ukv = self.rain_actors["UKV rain"].mapper.dataset
             if ready["ukv"] is not None:
-                self.ukv.cell_data["rain"] = _shown(ready["ukv"])
+                ukv.cell_data["rain"] = _shown(ready["ukv"])
                 ukv_text = f"UKV {self.ukv_run} T+{self._lead(t, self.ukv_run)}"
             else:
-                self.ukv.cell_data["rain"][:] = np.nan
-                self.ukv.Modified()
+                ukv.cell_data["rain"][:] = np.nan
+                ukv.Modified()
 
-        isobars = ready["isobars"]
-        for actor in self.dynamic:
-            pl.remove_actor(actor, render=False)
-        self.dynamic = []
-        if isobars.n_points:
-            self.dynamic.append(pl.add_mesh(isobars, color="#1a1a1a",
-                                            line_width=1.5, zlevel=6))
-        pts, labels = ready["labels"]
-        if pts is not None:
-            self.dynamic.append(pl.add_point_labels(
-                pts, labels, font_size=11, text_color="#1a1a1a",
-                shape=None, show_points=False, always_visible=False,
-                render=False))
+        for name, actors in self.isobar_actors.items():
+            for actor in actors:
+                pl.remove_actor(actor, render=False)
+            actors.clear()
+            iso, (pts, labels) = ready[name]
+            colour = ISOBAR_COLOUR[name]
+            if iso is not None and iso.n_points:
+                actors.append(pl.add_mesh(
+                    iso, color=colour, line_width=1.5,
+                    zlevel=6 if name == "Global MSLP" else 7))
+            if pts is not None:
+                actors.append(pl.add_point_labels(
+                    pts, labels, font_size=11, text_color=colour,
+                    shape=None, show_points=False, always_visible=False,
+                    render=False))
+            for actor in actors:
+                actor.SetVisibility(self.visible[name])
 
-        pl.add_text(f"Hourly rainfall, valid {t:%a %d %b %H:%M} UTC\n"
+        pl.add_text(f"Valid {t:%a %d %b %H:%M} UTC: hourly rainfall, "
+                    "MSLP every 4 hPa\n"
                     f"{ukv_text} (on top), Global {self.glo_run} "
-                    f"T+{self._lead(t, self.glo_run)}; "
-                    "Global MSLP isobars every 4 hPa\n"
+                    f"T+{self._lead(t, self.glo_run)}\n"
                     "Native model cells, no resampling. Prototype.",
                     position="upper_left", font_size=10, color="white",
                     name="title")
@@ -483,6 +555,9 @@ def main():
                     help="Global area drawn (default: %(default)s)")
     ap.add_argument("--view", choices=["ireland", "atlantic"],
                     default="ireland")
+    ap.add_argument("--hide", nargs="*", default=[], choices=sorted(LAYERS),
+                    metavar="LAYER", help="layers to start switched off "
+                    f"(any of: {', '.join(LAYERS)})")
     ap.add_argument("--steps", type=int, default=0,
                     help="hours to step before a screenshot (testing)")
     ap.add_argument("--screenshot", help="write a PNG and exit")
@@ -490,6 +565,8 @@ def main():
     ARCHIVE = args.archive
 
     g = Globe(args)
+    for name in args.hide:
+        g.set_visible(name, False)
     if args.steps:
         g.step(args.steps, render=False)
     if args.screenshot:
