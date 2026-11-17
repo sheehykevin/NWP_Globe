@@ -31,6 +31,9 @@ MODELS = {
     "ukv": dict(label="UKV", dir="ukv", prefix=None),
     "global": dict(label="Global", dir="global10km",
                    prefix="global-deterministic-10km"),
+    # Fetched by globe_fetch.py into data/ in the same layout.
+    "harmonie": dict(label="HARMONIE (KNMI)", dir="harmonie", prefix=None),
+    "ibi": dict(label="IBI waves", dir="ibi", prefix=None),
 }
 # Parameters that are accumulations carry their period in the name.
 ACCUMULATED = {"precipitation_accumulation"}

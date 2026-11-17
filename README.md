@@ -1,8 +1,9 @@
 # UKMO NWP Globe
 
-A 3D globe for Met Office model output, for the larger-domain models
-where a flat map distorts. The UKMO NWP viewer's layers, for UKV and
-the Global 10 km model, on one globe you can spin and zoom, with a layer
+A 3D globe for weather and wave model output, for the larger-domain
+models where a flat map distorts. The UKMO NWP viewer's layers for UKV,
+HARMONIE (KNMI) and the Met Office Global 10 km model, plus IBI waves
+(Copernicus Marine), on one globe you can spin and zoom, with a layer
 panel per model and time controls like the viewer. It does not replace
 the flat viewer in the UKMO NWP tools.
 
@@ -27,8 +28,8 @@ conda run -n ukmo_globe python globe.py
 
 ## Layers
 
-Every layer exists for both models, with the viewer's bands, colours,
-default opacity and default on/off.
+Each weather model has these layers (those it has data for), with the
+viewer's bands, colours, default opacity and default on/off.
 
 | Layer | From | On at start |
 |---|---|---|
@@ -53,6 +54,32 @@ data after T+54.
 
 Times run hourly, then 3-hourly in the Global tail to T+69 (UKV to its
 own last lead).
+
+## Models
+
+| Model | Grid | From | Notes |
+|---|---|---|---|
+| UKV | 2 km Lambert equal area | UKMO NWP tools' archive | |
+| HARMONIE (KNMI) | P4a: rotated pole, 0.05 deg (about 5.5 km), Europe | KNMI Open Data API, control member of the latest run | Fetch menu; about 6 GB streamed per run, only the control member's fields kept |
+| Global | 10 km lat/lon | archive, then the Met Office AWS bucket | downloads while a layer is on |
+| IBI waves | about 3 km lat/lon, 19W-5E, 26-56N | Copernicus Marine `IBI_ANALYSISFORECAST_WAV_005_005` | Fetch menu; significant wave height and mean wave direction (arrows point where the waves go) |
+
+HARMONIE and IBI are fetched by `globe_fetch.py` (also from the window's
+**Fetch** menu, then **Reload the globe**) into `data\` in the same layout
+as the Met Office files. HARMONIE winds are turned from the rotated grid
+to true north; its hourly rain is the step in its run accumulation.
+
+    conda run -n ukmo_globe python globe_fetch.py harmonie [--run YYYYMMDDHH]
+    conda run -n ukmo_globe python globe_fetch.py ibi [--start YYYYMMDDHH] [--hours 72]
+
+- **KNMI**: an API key from https://developer.dataplatform.knmi.nl, in the
+  `KNMI_API_KEY` environment variable or a `.env` file here with
+  `KNMI_API_KEY=...` (git-ignored).
+- **Copernicus Marine**: run `copernicusmarine login` once.
+- The first HARMONIE fetch writes `docs\harmonie_inventory.md`, every
+  GRIB field in the control member. Fields taken now: MSLP, 2 m
+  temperature, 10 m wind, gust, CAPE, accumulated precipitation, by their
+  KNMI table numbers; any not in the run are left out.
 
 ## Data
 
@@ -116,6 +143,7 @@ kept), so reopening a run is quick and stepping is near-instant.
 | `globe_core.py` | Layers, rain sums, drawing and background preparation; no window code |
 | `globe_data.py` | Finding files and downloading Global ones |
 | `globe_pressure.py` | High/low centres, copied from the UKMO NWP tools |
+| `globe_fetch.py` | Fetching HARMONIE (KNMI) and IBI waves (Copernicus Marine) |
 | `globe.py` | The Qt window and the command line |
 
 ## Notes

@@ -42,7 +42,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ARCHIVE = os.path.normpath(os.path.join(HERE, "..", "ukmo_nwp", "data",
                                         "archive"))
 CACHE = os.path.join(HERE, "cache")
-CACHE_VERSION = 6                   # bump when prepared data changes
+CACHE_VERSION = 7                   # bump when prepared data changes
 KEEP_CACHED_RUNS = 6
 
 RAIN = "precipitation_accumulation"
@@ -107,13 +107,24 @@ STYLES = {
                  units="hPa", visible=True),
     "barbs": dict(name="10 m wind barbs", kind="barbs", colour="#202020",
                   units="knots"),
+    "waves": dict(name="Significant wave height", kind="raster",
+                  param="sea_surface_wave_significant_height", units="m",
+                  levels=[0, 0.5, 1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10, 14],
+                  colours=["#dff3ff", "#b7e3fb", "#84cbf2", "#4fa9e3",
+                           "#2b7fd0", "#2a9d6f", "#8cc63f", "#f5e33a",
+                           "#f7a02c", "#e8452c", "#b51f5b", "#6b1a7a"],
+                  opacity=0.85, visible=True),
+    "wave_dir": dict(name="Mean wave direction", kind="arrows",
+                     param="sea_surface_wave_from_direction",
+                     colour="#202020", units="degrees", visible=True),
     "centres": dict(name="High / low centres", kind="centres",
                     units="hPa", visible=True),
 }
 RASTERS = [k for k, s in STYLES.items() if s["kind"] == "raster"]
 CENTRE_COLOURS = {"H": "#1f4fbf", "L": "#d01c1c"}
 BARB_STRIDE = {"ukv": 24}      # UKV cells: about 48 km
-BARB_KM = 48.0                 # Global barb spacing
+BARB_KM = 48.0                 # barb spacing on lat/lon grids
+ARROW_KM = 30.0                # wave arrow spacing
 BARB_LENGTH = 0.0055                           # globe radii, about 35 km
 
 HOME = (-8.0, 53.4, 7.0)            # lon, lat, zoom
@@ -129,6 +140,22 @@ warnings.filterwarnings("ignore", message="geovista found no coordinate")
 READ_LOCK = threading.Lock()
 CLEAR = 255                         # class code: see-through
 PENDING = object()                  # cache marker: not prepared yet
+
+
+MODEL_ORDER = ["ukv", "harmonie", "global", "ibi"]
+WAVES = ("waves", "wave_dir")               # the IBI model's only layers
+
+
+def needs(style):
+    """Parameters a style is drawn from."""
+    s = STYLES[style]
+    if "hours" in s:
+        return [RAIN]
+    if s["kind"] in ("raster", "arrows"):
+        return [s["param"]]
+    if s["kind"] == "barbs":
+        return [WIND, WDIR]
+    return [MSLP]
 
 
 def layer_id(model, style):
@@ -284,6 +311,89 @@ def barb_mesh(lon, lat, knots, from_deg, length=BARB_LENGTH):
     return pv.PolyData(pts, lines=lines)
 
 
+def arrow_mesh(lon, lat, from_deg, length=0.004):
+    """Arrows on the globe pointing where something goes (the opposite
+    of a "from" direction), all the same length."""
+    ok = np.isfinite(from_deg)
+    if not ok.any():
+        return pv.PolyData()
+    lam, phi = np.radians(lon[ok]), np.radians(lat[ok])
+    d = np.radians(from_deg[ok] + 180.0)[:, None]
+    east = np.column_stack([-np.sin(lam), np.cos(lam), np.zeros_like(lam)])
+    north = np.column_stack([-np.sin(phi) * np.cos(lam),
+                             -np.sin(phi) * np.sin(lam), np.cos(phi)])
+    s = np.sin(d) * east + np.cos(d) * north     # direction of travel
+    side = np.cos(d) * east - np.sin(d) * north
+    centre = xyz(lon[ok], lat[ok]).astype(float) * 1.002
+    tail, tip = centre - 0.5 * length * s, centre + 0.5 * length * s
+    back = tip - 0.35 * length * s
+    a = np.concatenate([tail, tip, tip])
+    b = np.concatenate([tip, back + 0.2 * length * side,
+                        back - 0.2 * length * side])
+    pts = np.empty((2 * len(a), 3), np.float32)
+    pts[0::2], pts[1::2] = a, b
+    n = len(a)
+    lines = np.column_stack([np.full(n, 2), 2 * np.arange(n),
+                             2 * np.arange(n) + 1]).ravel()
+    return pv.PolyData(pts, lines=lines)
+
+
+def _latlon_cut(x, y, km, deg=True):
+    """Indices of cells about ``km`` apart on a lon/lat-like grid:
+    columns get narrower towards the poles, so each row takes a wider
+    column step."""
+    dy = abs(y[1] - y[0]) * 111.2
+    dx = abs(x[1] - x[0]) * 111.2
+    rows, cols = [], []
+    for j in range(0, y.size, max(1, round(km / dy))):
+        shrink = np.cos(np.radians(y[j])) if deg else 1.0
+        step = max(1, round(km / max(dx * shrink, 1e-3)))
+        c = np.arange(step // 2, x.size, step)
+        rows.append(np.full(c.size, j))
+        cols.append(c)
+    return np.concatenate(rows), np.concatenate(cols)
+
+
+class RotatedGrid:
+    """A rotated-pole lat/lon grid (HARMONIE), from a stored field."""
+
+    world = False
+
+    def __init__(self, path):
+        with xr.open_dataset(path) as ds:
+            var = next(ds[k] for k in ds.data_vars if ds[k].ndim >= 2)
+            attrs = {k: var.attrs[k] for k in (
+                "grid_mapping_name", "grid_north_pole_latitude",
+                "grid_north_pole_longitude")}
+            self.x = ds["rlon"].values.astype(float)
+            self.y = ds["rlat"].values.astype(float)
+        self.crs = CRS.from_cf(attrs)
+        self.transform = Transformer.from_crs(self.crs, "EPSG:4326",
+                                              always_xy=True).transform
+        dx, dy = self.x[1] - self.x[0], self.y[1] - self.y[0]
+        self.x_edges = np.append(self.x - dx / 2, self.x[-1] + dx / 2)
+        self.y_edges = np.append(self.y - dy / 2, self.y[-1] + dy / 2)
+        self.barb_cut = _latlon_cut(self.x, self.y, BARB_KM, deg=False)
+        self.barb_lon, self.barb_lat = self.transform(
+            self.x[self.barb_cut[1]], self.y[self.barb_cut[0]])
+        self._mesh = None
+
+    def mesh(self):
+        if self._mesh is None:
+            xx, yy = np.meshgrid(self.x_edges, self.y_edges)
+            lon, lat = self.transform(xx, yy)
+            shape = (self.y.size, self.x.size)
+            self._mesh = gv.Transform.from_2d(
+                lon, lat, data=np.full(shape, np.nan), name="value")
+        return self._mesh.copy(deep=True)
+
+    def cut(self, values):
+        return values
+
+    def lonlat(self, x, y):
+        return self.transform(np.asarray(x), np.asarray(y))
+
+
 class UkvGrid:
     """The UKV grid: cell edges and centres, and its projection."""
 
@@ -330,14 +440,14 @@ class GlobalGrid:
     transform = None
     crs = "EPSG:4326"
 
-    def __init__(self, path, area):
+    def __init__(self, path, area, wrap=None, km=BARB_KM):
         with xr.open_dataset(path) as ds:
             lonb = ds["longitude_bnds"].values
             latb = ds["latitude_bnds"].values
             lon = ds["longitude"].values
             lat = ds["latitude"].values
-        self.world = area is None
-        if self.world:
+        self.world = (area is None) if wrap is None else wrap
+        if area is None:
             rows = np.arange(lat.size)
             cols = np.arange(lon.size)
         else:
@@ -351,18 +461,7 @@ class GlobalGrid:
         lb, tb = lonb[self.cols], latb[self.rows]
         self.lon_edges = np.append(lb[:, 0], lb[-1, 1])
         self.lat_edges = np.append(tb[:, 0], tb[-1, 1])
-        # Barbs about BARB_KM apart everywhere: columns get narrower
-        # towards the poles, so each row takes a wider column step.
-        dy = abs(self.y[1] - self.y[0]) * 111.2
-        dx = abs(self.x[1] - self.x[0]) * 111.2
-        rows, cols = [], []
-        for j in range(0, self.y.size, max(1, round(BARB_KM / dy))):
-            step = max(1, round(BARB_KM / max(
-                dx * np.cos(np.radians(self.y[j])), 1e-3)))
-            c = np.arange(step // 2, self.x.size, step)
-            rows.append(np.full(c.size, j))
-            cols.append(c)
-        self.barb_cut = (np.concatenate(rows), np.concatenate(cols))
+        self.barb_cut = _latlon_cut(self.x, self.y, km)
         self.barb_lon = self.x[self.barb_cut[1]]
         self.barb_lat = self.y[self.barb_cut[0]]
 
@@ -458,22 +557,31 @@ class Scene:
                  archive=None):
         self.pl = pl
         archive = archive or ARCHIVE
-        self.runs = {"ukv": ukv_run or data.latest_run("ukv", archive),
-                     "global": global_run or data.latest_run("global",
-                                                             archive)}
+        given = {"ukv": ukv_run, "global": global_run}
+        self.runs = {}
+        for m in MODEL_ORDER:
+            try:
+                self.runs[m] = given.get(m) or data.latest_run(m, archive)
+            except SystemExit:
+                if m in ("ukv", "global"):
+                    raise
         data.prune_downloads(keep_run=self.runs["global"])
         self.files = {m: data.Files(m, r, archive)
                       for m, r in self.runs.items()}
-        self.grids = {"ukv": self._ukv_grid(),
-                      "global": self._global_grid(area)}
-        self.models = [m for m in ("ukv", "global") if self.grids[m]]
+        self.grids = {m: self._grid(m, area) for m in self.runs}
+        self.models = [m for m in MODEL_ORDER if self.grids.get(m)]
         self.order = list(self.models)          # top model first
+        # Each model lists the layers it has data for.
+        self.styles = {m: [s for s in STYLES if ((m == "ibi") == (s in WAVES))
+                           and all(self.files[m].expected(p)
+                                   for p in needs(s))]
+                       for m in self.models}
 
-        # Time axis: every valid time either model has (or, for Global,
+        # Time axis: every valid time any model has (or, for Global,
         # publishes): hourly, then 3-hourly in the Global tail.
         times = set()
         for m in self.models:
-            for param in (MSLP, RAIN):
+            for param in {p for s in self.styles[m] for p in needs(s)}:
                 times |= {v for v, _ in self.files[m].expected(param)}
         self.times = sorted(times)
         if valid:
@@ -487,7 +595,8 @@ class Scene:
             start = both[0] if both else self.times[0]
         self.i = self.times.index(start)
 
-        self.layers = [layer_id(m, s) for m in self.models for s in STYLES]
+        self.layers = [layer_id(m, s) for m in self.models
+                       for s in self.styles[m]]
         self.visible = {lid: STYLES[split_id(lid)[1]].get("visible", False)
                         for lid in self.layers}
         self.model_on = {m: True for m in self.models}
@@ -502,8 +611,8 @@ class Scene:
         self.wake = threading.Event()
         self.dirty = False
         self.disk = os.path.join(
-            CACHE, f"v{CACHE_VERSION}_{self.runs['global']}_"
-                   f"{self.runs['ukv']}_{area}")
+            CACHE, f"v{CACHE_VERSION}_" + "_".join(
+                self.runs[m] for m in self.models) + f"_{area}")
         os.makedirs(self.disk, exist_ok=True)
         os.utime(self.disk)                     # newest for pruning
         _prune_cache()
@@ -523,7 +632,8 @@ class Scene:
         pl.set_background("#0b1020")
         texture = gv.natural_earth_1() if base == "colour" else grey_texture()
         pl.add_base_layer(texture=texture, zlevel=0)
-        pl.add_coastlines(color="black", line_width=1, zlevel=40)
+        pl.add_coastlines(color="black", line_width=1,
+                         zlevel=2 + 2 * len(RASTERS) * len(self.order) + 2)
 
         lon, lat, zoom = ATLANTIC if view == "atlantic" else HOME
         self.go_to(lon, lat, zoom)
@@ -532,11 +642,20 @@ class Scene:
         # never rolls it: north stays up while dragging.
         pl.enable_terrain_style(mouse_wheel_zooms=True, shift_pans=True)
 
-    def _ukv_grid(self):
-        for param in (RAIN, MSLP, WIND):
-            held = self.files["ukv"].held(param)
+    def _grid(self, model, area):
+        if model == "global":
+            return self._global_grid(area)
+        params = {"ibi": [STYLES["waves"]["param"]]}.get(
+            model, [MSLP, RAIN, WIND])
+        for param in params:
+            held = self.files[model].held(param)
             if held:
-                return UkvGrid(next(iter(held.values())))
+                path = next(iter(held.values()))
+                if model == "ukv":
+                    return UkvGrid(path)
+                if model == "harmonie":
+                    return RotatedGrid(path)
+                return GlobalGrid(path, None, wrap=False, km=ARROW_KM)
         return None
 
     def _global_grid(self, area):
@@ -599,8 +718,9 @@ class Scene:
         rank = len(self.order) - 1 - self.order.index(model)
         if STYLES[style]["kind"] == "raster":
             return 2 + 2 * (rank * len(RASTERS) + RASTERS.index(style))
-        return {"isobars": 44, "barbs": 48, "centres": 52}[
-            STYLES[style]["kind"]] + 2 * rank
+        base = 2 + 2 * len(RASTERS) * len(self.order) + 4
+        return base + {"isobars": 0, "barbs": 10, "arrows": 10,
+                       "centres": 20}[STYLES[style]["kind"]] + 2 * rank
 
     def _add_raster(self, lid, mesh):
         style = STYLES[split_id(lid)[1]]
@@ -769,6 +889,13 @@ class Scene:
             mesh = barb_mesh(grid.barb_lon, grid.barb_lat,
                              speed[cut].ravel(), dirn[cut].ravel())
             return mesh, (None, [])
+        if style["kind"] == "arrows":
+            dirn = self._field(model, style["param"], t)
+            if dirn is None:
+                return None
+            cut = grid.barb_cut
+            return arrow_mesh(grid.barb_lon, grid.barb_lat,
+                              dirn[cut].ravel()), (None, [])
         hpa = self._field(model, MSLP, t, 0.01)
         if hpa is None:
             return None
@@ -776,7 +903,13 @@ class Scene:
             iso = isobar_mesh(grid.x, grid.y, hpa, to_lonlat=grid.transform,
                               wrap=grid.world)
             return iso, isobar_labels(iso)
-        found = find_pressure_centres(hpa, grid.x, grid.y, crs=grid.crs)
+        if isinstance(grid, RotatedGrid):
+            # Rotated degrees are close to equal distances on this grid.
+            found = find_pressure_centres(hpa, grid.x, grid.y,
+                                          coordinate_unit_to_metre=111195.0)
+        else:
+            found = find_pressure_centres(hpa, grid.x, grid.y,
+                                          crs=grid.crs)
         if not found:
             return pv.PolyData(), (None, [])
         lon, lat = grid.lonlat([c["x"] for c in found],
@@ -855,8 +988,9 @@ class Scene:
         for m in self.models:
             label = data.MODELS[m]["label"]
             lead = lead_hours(t, self.runs[m])
-            has = any(v == t for v, _ in self.files[m].expected(MSLP)) or \
-                any(v == t for v, _ in self.files[m].expected(RAIN))
+            has = any(v == t for p in {q for s in self.styles[m]
+                                       for q in needs(s)}
+                      for v, _ in self.files[m].expected(p))
             out.append(f"{label} T+{lead}" if has and lead >= 0
                        else f"{label}: no data")
         return ", ".join(out)

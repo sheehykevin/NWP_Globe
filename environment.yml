@@ -3,11 +3,20 @@ channels:
   - conda-forge
 dependencies:
   - python=3.12
-  - geovista
+  - geovista=0.5.3
+  # GeoVista 0.5.3 breaks with pyvista 0.49 / vtk 9.7: keep these.
+  - pyvista=0.44.2
+  - vtk=9.3.1
   - pyvistaqt
   - pyqt
   - netcdf4
   - xarray
   - pyproj
-  - pyflakes
   - scipy
+  - pyflakes
+  # HARMONIE (KNMI GRIB1) and IBI waves (Copernicus Marine)
+  - eccodes
+  - python-eccodes
+  - cfgrib
+  - requests
+  - copernicusmarine

@@ -52,8 +52,9 @@ def colour_key(style, QtGui, QtCore):
             pen.setWidth(2)
             p.setPen(pen)
             p.drawLine(0, 7, 30, 7)
-            text = ("every 4 hPa" if style["kind"] == "isobars"
-                    else "knots: half 5, full 10, pennant 50")
+            text = {"isobars": "every 4 hPa",
+                    "arrows": "where the waves are going"}.get(
+                style["kind"], "knots: half 5, full 10, pennant 50")
         p.setPen(QtGui.QColor("#555555"))
         p.drawText(40, 0, w - 40, 14, QtCore.Qt.AlignLeft, text)
         p.end()
@@ -131,7 +132,7 @@ def run_window(args):
         rows.setContentsMargins(18, 0, 0, 0)
         rows.setVerticalSpacing(1)
         r = 0
-        for name in reversed(list(STYLES)):        # top layer first
+        for name in reversed(scene.styles[model]):  # top layer first
             lid = core.layer_id(model, name)
             style = STYLES[name]
             tick = QtWidgets.QCheckBox(style["name"])
@@ -313,6 +314,51 @@ def run_window(args):
     north.triggered.connect(lambda: scene.north_up())
     bar.addSeparator()
     bar.addWidget(status)
+    bar.addSeparator()
+
+    # ---- fetching HARMONIE and IBI (a separate process) ----
+    import os
+    fetch_proc = QtCore.QProcess(win)
+    fetch_proc.setProcessChannelMode(QtCore.QProcess.MergedChannels)
+    fetch_btn = QtWidgets.QToolButton()
+    fetch_btn.setText("Fetch")
+    fetch_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+    fetch_menu = QtWidgets.QMenu(fetch_btn)
+    fetch_btn.setMenu(fetch_menu)
+    bar.addWidget(fetch_btn)
+    fetch_note = QtWidgets.QLabel()
+    bar.addWidget(fetch_note)
+
+    def fetch(what):
+        if fetch_proc.state() != QtCore.QProcess.NotRunning:
+            return
+        fetch_note.setText(f"  fetching {what} ...")
+        fetch_proc.start(sys.executable, [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "globe_fetch.py"), what])
+
+    def fetch_output():
+        text = bytes(fetch_proc.readAll()).decode("utf-8", "replace")
+        lines = [s for s in text.splitlines() if s.strip()]
+        if lines:
+            fetch_note.setText("  " + lines[-1][:80])
+
+    def fetch_done(code, _status):
+        fetch_note.setText("  fetched: Reload to show it" if code == 0
+                           else "  fetch failed (see the last message)")
+    fetch_proc.readyRead.connect(fetch_output)
+    fetch_proc.finished.connect(fetch_done)
+    fetch_menu.addAction("HARMONIE: latest KNMI run (about 6 GB "
+                         "download)", lambda: fetch("harmonie"))
+    fetch_menu.addAction("IBI waves: today 00Z to +72 h",
+                         lambda: fetch("ibi"))
+    fetch_menu.addSeparator()
+
+    def reload():
+        # A fresh window reads every model's newest run again.
+        QtCore.QProcess.startDetached(sys.executable, sys.argv)
+        app.quit()
+    fetch_menu.addAction("Reload the globe", reload)
 
     def poll():
         scene.refresh()
@@ -367,7 +413,8 @@ def run_screenshot(args):
     for lid in args.hide:
         scene.visible[lid] = False
     if args.order:
-        scene.order = args.order
+        scene.order = [m for m in args.order if m in scene.models] + [
+            m for m in scene.order if m not in args.order]
     if args.steps:
         scene.i = min(scene.i + args.steps, len(scene.times) - 1)
     scene.show(render=False, block=True)
@@ -398,8 +445,9 @@ def main():
     ap.add_argument("--hide", nargs="*", default=[], choices=ALL_LAYERS,
                     metavar="MODEL:LAYER",
                     help="with --screenshot: layers off")
-    ap.add_argument("--order", nargs=2, choices=list(data.MODELS),
-                    help="with --screenshot: models top first")
+    ap.add_argument("--order", nargs="+", choices=list(data.MODELS),
+                    help="with --screenshot: models to draw on top, top "
+                    "first (the rest follow)")
     ap.add_argument("--steps", type=int, default=0,
                     help="with --screenshot: time steps to move first")
     ap.add_argument("--smoke", help="testing: open the window, save a "
