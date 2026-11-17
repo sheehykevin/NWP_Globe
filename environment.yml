@@ -1,0 +1,12 @@
+name: ukmo_globe
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - geovista
+  - pyvistaqt
+  - pyqt
+  - netcdf4
+  - xarray
+  - pyproj
+  - pyflakes
