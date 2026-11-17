@@ -210,56 +210,58 @@ def isobar_labels(isobars, spacing=0.12):
     return pts[kept] * 1.004, [f"{hpa[i]:.0f}" for i in kept]
 
 
+def _groups(counts):
+    """For each item repeated counts[i] times: (item index, 0..n-1)."""
+    idx = np.repeat(np.arange(counts.size), counts)
+    starts = np.repeat(np.cumsum(counts) - counts, counts)
+    return idx, np.arange(idx.size) - starts
+
+
 def barb_mesh(lon, lat, knots, from_deg, length=BARB_LENGTH):
-    """Standard wind barbs as lines on the globe.
+    """Standard wind barbs as lines on the globe (all barbs at once).
 
     The staff points to where the wind comes from; feathers sit on its
     clockwise side (northern hemisphere convention): a pennant for 50
     knots, a full feather for 10, a half for 5. Below 2.5 knots nothing
     is drawn."""
-    pts, cells = [], []
-
-    def line(*ps):
-        start = sum(len(p) for p in pts)
-        pts.append(np.array(ps))
-        cells.append([len(ps), *range(start, start + len(ps))])
-
-    lam, phi = np.radians(lon), np.radians(lat)
-    for k in range(lon.size):
-        kt = knots[k]
-        if not np.isfinite(kt) or kt < 2.5 or not np.isfinite(from_deg[k]):
-            continue
-        east = np.array([-np.sin(lam[k]), np.cos(lam[k]), 0.0])
-        north = np.array([-np.sin(phi[k]) * np.cos(lam[k]),
-                          -np.sin(phi[k]) * np.sin(lam[k]),
-                          np.cos(phi[k])])
-        d = np.radians(from_deg[k])
-        s = np.sin(d) * east + np.cos(d) * north     # towards the source
-        side = np.cos(d) * east - np.sin(d) * north  # clockwise of s
-        base = xyz(lon[k:k + 1], lat[k:k + 1])[0] * 1.002
-        tip = base + length * s
-        line(base, tip)
-        rest = int(5 * round(kt / 5.0))
-        pennants, rest = divmod(rest, 50)
-        fulls, rest = divmod(rest, 10)
-        half = rest >= 5
-        pos, step = tip, 0.13 * length * s
-        feather = 0.38 * length * side + 0.12 * length * s
-        for _ in range(pennants):
-            line(pos, pos + 0.38 * length * side, pos - 0.16 * length * s,
-                 pos)
-            pos = pos - 0.2 * length * s
-        for _ in range(fulls):
-            line(pos, pos + feather)
-            pos = pos - step
-        if half:
-            if pennants == 0 and fulls == 0:
-                pos = pos - step            # a lone half feather sits in
-            line(pos, pos + 0.5 * feather)
-    if not pts:
+    ok = np.isfinite(knots) & np.isfinite(from_deg) & (knots >= 2.5)
+    if not ok.any():
         return pv.PolyData()
-    return pv.PolyData(np.concatenate(pts).astype(np.float32),
-                       lines=np.concatenate([np.array(c) for c in cells]))
+    lam, phi = np.radians(lon[ok]), np.radians(lat[ok])
+    d = np.radians(from_deg[ok])[:, None]
+    east = np.column_stack([-np.sin(lam), np.cos(lam), np.zeros_like(lam)])
+    north = np.column_stack([-np.sin(phi) * np.cos(lam),
+                             -np.sin(phi) * np.sin(lam), np.cos(phi)])
+    s = np.sin(d) * east + np.cos(d) * north     # towards the source
+    side = np.cos(d) * east - np.sin(d) * north  # clockwise of s
+    base = xyz(lon[ok], lat[ok]).astype(float) * 1.002
+    tip = base + length * s
+    feather = 0.38 * length * side + 0.12 * length * s
+
+    r = (5 * np.rint(knots[ok] / 5.0)).astype(int)
+    P, F, H = r // 50, (r % 50) // 10, (r % 10) >= 5
+    a, b = [base], [tip]                          # staffs
+    i, k = _groups(P)                              # pennants
+    pos = tip[i] - (0.2 * length * k)[:, None] * s[i]
+    corner = pos + 0.38 * length * side[i]
+    a += [pos, corner]
+    b += [corner, pos - 0.16 * length * s[i]]
+    i, k = _groups(F)                              # full feathers
+    pos = tip[i] - ((0.2 * P[i] + 0.13 * k) * length)[:, None] * s[i]
+    a.append(pos)
+    b.append(pos + feather[i])
+    i = np.flatnonzero(H)                          # half feathers
+    k = F[i] + ((P[i] == 0) & (F[i] == 0))         # a lone half sits in
+    pos = tip[i] - ((0.2 * P[i] + 0.13 * k) * length)[:, None] * s[i]
+    a.append(pos)
+    b.append(pos + 0.5 * feather[i])
+    a, b = np.concatenate(a), np.concatenate(b)
+    pts = np.empty((2 * len(a), 3), np.float32)
+    pts[0::2], pts[1::2] = a, b
+    n = len(a)
+    lines = np.column_stack([np.full(n, 2), 2 * np.arange(n),
+                             2 * np.arange(n) + 1]).ravel()
+    return pv.PolyData(pts, lines=lines)
 
 
 class UkvGrid:
@@ -468,11 +470,25 @@ class Scene:
         os.utime(self.disk)                     # newest for pruning
         _prune_cache()
 
+        # GeoVista checks the graphics card's opacity support (about
+        # 1.4 s, by starting a program) on every add_mesh that sets an
+        # opacity, including nan_opacity. Once per window is enough.
+        check = getattr(pl, "_warn_opacity", None)
+        if check is not None:
+            done = []
+
+            def check_once():
+                if not done:
+                    done.append(True)
+                    check()
+            pl._warn_opacity = check_once
         pl.set_background("#0b1020")
         texture = gv.natural_earth_1() if base == "colour" else grey_texture()
         pl.add_base_layer(texture=texture, zlevel=0)
         # Raster layers keep one mesh each; a time step only changes the
-        # class values on it. Drawn opaque unless a slider says otherwise.
+        # class values on it. Opacity is set on the actor afterwards:
+        # passing it to GeoVista's add_mesh starts a slow graphics-card
+        # check (about 1.4 s) every time.
         for name, spec in LAYERS.items():
             grid = self.grids[spec["model"]]
             if spec["kind"] != "raster" or grid is None:
@@ -481,8 +497,8 @@ class Scene:
             actor = pl.add_mesh(grid.mesh(), zlevel=spec["z"],
                                 scalars="value", cmap=spec["colours"],
                                 clim=(-0.5, n - 0.5), n_colors=n,
-                                nan_opacity=0.0, show_scalar_bar=False,
-                                opacity=spec["opacity"])
+                                nan_opacity=0.0, show_scalar_bar=False)
+            _set_opacity(actor, spec["opacity"])
             self.actors[name] = [actor]
             actor.SetVisibility(self.visible[name])
         pl.add_coastlines(color="black", line_width=1, zlevel=8)
@@ -642,8 +658,7 @@ class Scene:
             if mesh.n_points:
                 self.actors[name].append(pl.add_mesh(
                     mesh, color=spec["colour"], zlevel=spec["z"],
-                    line_width=1.5 if spec["kind"] == "isobars" else 1.2,
-                    opacity=self.opacity[name]))
+                    line_width=1.5 if spec["kind"] == "isobars" else 1.2))
             if pts is not None:
                 self.actors[name].append(pl.add_point_labels(
                     pts, labels, font_size=11, text_color=spec["colour"],
