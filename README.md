@@ -86,6 +86,11 @@ own last lead).
 
 ## Models
 
+What each source publishes (every field, from its live listings) is in
+[docs/models](docs/models/), with a cross-model table in
+[docs/models/SUMMARY.md](docs/models/SUMMARY.md). Regenerate with
+`conda run -n ukmo_globe python tools/model_inventory.py`.
+
 The globe opens empty. Each model's group in the layer panel has a
 download button (a box with a down arrow) that fetches that model's
 latest run; nothing is downloaded until you press it. Everything
