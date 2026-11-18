@@ -127,6 +127,8 @@ def run_window(args):
     from geovista.qt import GeoQtInteractor
     from qtpy import QtCore, QtGui, QtWidgets
 
+    from datetime import datetime, timezone
+
     import globe_jobs as jobs
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -324,6 +326,7 @@ def run_window(args):
 
     # ---- layer panel: one group per model, drag to reorder ----
     ui = {}                          # model -> its group's live widgets
+    newest = {}                      # model -> newest published run seen
     def layer_state(model):
         """({layer: hours prepared in the store}, hours in the run)."""
         if model not in scene.models:
@@ -367,11 +370,21 @@ def run_window(args):
         title.setStyleSheet("font-weight:bold;text-align:left;padding:0")
         get = QtWidgets.QToolButton()
         get.clicked.connect(lambda _=False, m=model: header_clicked(m))
-        ui[model] = dict(get=get, rows={})
+        badge = QtWidgets.QPushButton()
+        badge.setFlat(True)
+        badge.setCursor(QtCore.Qt.PointingHandCursor)
+        badge.setStyleSheet("color:#ffffff;background:#2b6fd6;"
+                            "border-radius:6px;padding:0 6px;font-size:8pt")
+        badge.setToolTip("A newer run is published: click to fetch it "
+                         "(your fetched layers come with it)")
+        badge.clicked.connect(lambda _=False, m=model: fetch(m, latest=True))
+        badge.hide()
+        ui[model] = dict(get=get, rows={}, title=title, badge=badge)
         head.addWidget(grip)
         head.addWidget(fold)
         head.addWidget(on)
         head.addWidget(title, 1)
+        head.addWidget(badge)
         head.addWidget(get)
         lay.addLayout(head)
         note = QtWidgets.QLabel()
@@ -469,7 +482,25 @@ def run_window(args):
         except RuntimeError:             # widgets dropped by a reorder
             pass
 
+    def run_text(model):
+        """Header text: name, run and its age."""
+        label = data.MODELS[model]["label"]
+        if model not in scene.models:
+            return label + "  (no data)"
+        run = scene.runs[model]
+        age = (datetime.now(timezone.utc).replace(tzinfo=None)
+               - data.stamp(run)).total_seconds() / 3600
+        return f"{label}  {run[9:11]}Z {run[6:8]}/{run[4:6]}  ({age:.0f} h old)"
+
     def _refresh_group(model, w, resize):
+        w["title"].setText(run_text(model))
+        newer = newest.get(model)
+        show = bool(newer and model in scene.models
+                    and newer > scene.runs[model]
+                    and model not in running and not waiting[model])
+        if show:
+            w["badge"].setText(f"{newer[9:11]}Z available")
+        w["badge"].setVisible(show)
         text = progress.get(model, "")
         changed = w["note"].text() != text or w["note"].isVisible() != bool(
             text)
@@ -811,6 +842,30 @@ def run_window(args):
         readout.setText(html)
 
     view.track_click_position(picked, side="left", double=True)
+
+    # ---- newer runs: checked quietly in the background ----
+    def check_newer():
+        models = [m for m in panel_order if m in scene.models]
+
+        def work():
+            for m in models:
+                if data.CLOSING.is_set():
+                    return
+                try:
+                    run = jobs.latest_published(m)
+                except Exception:             # offline, server busy
+                    continue
+                if run:
+                    newest[m] = run
+        threading.Thread(target=work, daemon=True).start()
+    newer_timer = QtCore.QTimer(win)
+    newer_timer.timeout.connect(check_newer)
+    newer_timer.start(15 * 60 * 1000)
+    QtCore.QTimer.singleShot(20 * 1000, check_newer)
+    # Ages and badges: refreshed once a minute.
+    age_timer = QtCore.QTimer(win)
+    age_timer.timeout.connect(refresh_all)
+    age_timer.start(60 * 1000)
 
     last_cam = [None, None]
     shown_progress = [None]

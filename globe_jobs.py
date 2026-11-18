@@ -331,3 +331,25 @@ def run_queue():
         data.CLOSING.clear()
         failed += run_logged(model, layers, latest) or 0
     return 1 if failed else 0
+
+
+def latest_published(model):
+    """The newest run of ``model`` its source has published, as
+    YYYYMMDDTHHMMZ (None if it cannot be found). Network calls."""
+    from datetime import datetime, timezone
+    import globe_core as core
+    if model in core.WAVE_MODELS:              # today 00Z, as fetched
+        return f"{datetime.now(timezone.utc):%Y%m%d}T0000Z"
+    if model == "harmonie":
+        import requests
+        import globe_fetch
+        s = requests.Session()
+        s.headers["Authorization"] = globe_fetch.knmi_key()
+        listing = globe_fetch._knmi(s, "/files", maxKeys=5, orderBy="created",
+                                    sorting="desc")
+        for f in listing.get("files", []):
+            m = re.search(r"(\d{8})(\d{2})\.tar$", f["filename"])
+            if m:
+                return f"{m.group(1)}T{m.group(2)}00Z"
+        return None
+    return data.latest_run(model)
