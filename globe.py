@@ -269,6 +269,7 @@ def run_window(args):
 
     def finished(model):
         job = running.pop(model)
+        measure()
         was_stopped = model in stopped
         stopped.discard(model)
         if was_stopped and jobs.stored_run(model) is None:
@@ -356,6 +357,39 @@ def run_window(args):
 
     # ---- layer panel: one group per model, drag to reorder ----
     ui = {}                          # model -> its group's live widgets
+    sizes = {}                       # model -> bytes in the store
+
+    def human(n):
+        return f"{n / 1e9:.1f} GB" if n >= 1e8 else f"{n / 1e6:.0f} MB"
+
+    def measure():
+        """Disk use per model, in a thread; shown when it is done."""
+        def work():
+            for m in data.MODELS:
+                sizes[m] = jobs.model_size(m)
+            size_ready.set()
+        threading.Thread(target=work, daemon=True).start()
+    size_ready = threading.Event()
+
+    def model_menu(model, where):
+        menu = QtWidgets.QMenu(win)
+        act = menu.addAction("Clear this model's data")
+        act.setEnabled(model not in running and not waiting[model]
+                       and bool(sizes.get(model)))
+        if menu.exec_(where) is act:
+            if QtWidgets.QMessageBox.question(
+                    win, "Clear model data",
+                    f"Delete {data.MODELS[model]['label']}'s downloaded "
+                    f"data ({human(sizes.get(model, 0))})?") \
+                    != QtWidgets.QMessageBox.Yes:
+                return
+            scene.remove_model(model)
+            jobs.clear_model(model)
+            progress.pop(model, None)
+            sizes[model] = 0
+            build_items()
+            sync_slider()
+            update_store_label()
     newest = {}                      # model -> newest published run seen
     def layer_state(model):
         """({layer: hours prepared in the store}, hours in the run)."""
@@ -410,6 +444,10 @@ def run_window(args):
         badge.clicked.connect(lambda _=False, m=model: fetch(m, latest=True))
         badge.hide()
         ui[model] = dict(get=get, rows={}, title=title, badge=badge)
+        for w in (box, title):
+            w.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+            w.customContextMenuRequested.connect(
+                lambda pos, m=model, w=w: model_menu(m, w.mapToGlobal(pos)))
         head.addWidget(grip)
         head.addWidget(fold)
         head.addWidget(on)
@@ -524,6 +562,11 @@ def run_window(args):
 
     def _refresh_group(model, w, resize):
         w["title"].setText(run_text(model))
+        last = data.last_event(model)
+        w["title"].setToolTip(
+            "Open / fold this model's layers (right-click for more)"
+            + (f"\nOn disk: {human(sizes[model])}" if model in sizes else "")
+            + (f"\nLast store change: {last}" if last else ""))
         newer = newest.get(model)
         show = bool(newer and model in scene.models
                     and newer > scene.runs[model]
@@ -684,7 +727,16 @@ def run_window(args):
     for w in (models_btn, params_btn, go_fetch):
         fetch_row.addWidget(w)
     fetch_row.addStretch(1)
+    store_label = QtWidgets.QLabel()
+    store_label.setStyleSheet("color:#555;font-size:8pt")
+    store_label.setToolTip("Disk used by downloaded data and prepared "
+                           "layers")
+    fetch_row.addWidget(store_label)
     fetch_row.addWidget(clear_btn)
+
+    def update_store_label():
+        if sizes:
+            store_label.setText(f"Store: {human(sum(sizes.values()))}")
 
     panel = QtWidgets.QWidget()
     pl_lay = QtWidgets.QVBoxLayout(panel)
@@ -902,6 +954,10 @@ def run_window(args):
 
     def poll():
         poll_jobs()
+        if size_ready.is_set():
+            size_ready.clear()
+            update_store_label()
+            refresh_all()
         update_readout()
         # A model finished loading?
         while not done.empty():
@@ -1049,6 +1105,7 @@ def run_window(args):
                     done.put((model, exc))
             threading.Thread(target=work, daemon=True).start()
     build_items()
+    measure()
     for model in args.load:                     # optional, at start
         fetch(model, latest=True)
     if args.smoke:

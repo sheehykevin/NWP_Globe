@@ -69,6 +69,38 @@ def drop_old_cache(model, keep):
                        f"prepared layers; newer run {keep} kept")
 
 
+def model_size(model):
+    """Bytes a model uses in the store (its runs and prepared layers)."""
+    import globe_core as core
+    total = 0
+    for root, _, files in os.walk(os.path.join(data.DATA,
+                                               data.MODELS[model]["dir"])):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    for path in glob.glob(os.path.join(core.STORE_CACHE, f"{model}_*.npz")):
+        try:
+            total += os.path.getsize(path)
+        except OSError:
+            pass
+    return total
+
+
+def clear_model(model):
+    """Delete one model's runs and prepared layers from the store."""
+    import globe_core as core
+    shutil.rmtree(os.path.join(data.DATA, data.MODELS[model]["dir"]),
+                  ignore_errors=True)
+    for path in glob.glob(os.path.join(core.STORE_CACHE, f"{model}_*.npz")):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    data.log_event("clear", model, detail="Clear this model's data")
+
+
 def prepared_counts(model, run, folder=None):
     """{layer: hours prepared} of one model run in the store cache."""
     import globe_core as core

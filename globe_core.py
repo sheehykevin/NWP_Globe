@@ -786,19 +786,60 @@ class Scene:
                     self.label_on[lid] = False
                     self.lines[lid] = []
                     self.value_actors[lid] = []
+        self._retime()
+        self.wake.set()
+        self.show()
+
+    def _retime(self):
+        """The time axis: every hour any loaded model has; stays on the
+        shown time if it is still there, else the one nearest to now."""
         old = self.times[self.i] if self.times else None
         times = set()
         for mm in self.models:
             for param in {p for s in self.styles[mm] for p in needs(s)}:
                 times |= {v for v, _ in self.files[mm].expected(param)}
         self.times = sorted(times)
-        if old in self.times:
+        if not self.times:
+            self.i = 0
+        elif old in self.times:
             self.i = self.times.index(old)
         else:                                    # nearest to now
             now = datetime.now(timezone.utc).replace(tzinfo=None)
             self.i = int(np.argmin([abs((t - now).total_seconds())
                                     for t in self.times]))
-        self.wake.set()
+
+    def remove_model(self, m):
+        """Take a model off the globe (window thread): its drawings,
+        layers and prepared items."""
+        if m not in self.models:
+            return
+        with self.lock:
+            lids = [lid for lid in self.layers if split_id(lid)[0] == m]
+            for lid in lids:
+                actor = self.rasters.pop(lid, None)
+                for a in ([actor] if actor is not None else []) + \
+                        self.lines.pop(lid, []) + \
+                        self.value_actors.pop(lid, []):
+                    self.pl.remove_actor(a, render=False)
+                self.layers.remove(lid)
+                for d in (self.visible, self.opacity, self.label_on,
+                          self.raster_z, self.z_plan):
+                    d.pop(lid, None)
+            for key in [k for k in self.cache if split_id(k[0])[0] == m]:
+                del self.cache[key]
+            for key in [k for k in self.failures
+                        if split_id(k[0])[0] == m]:
+                del self.failures[key]
+            for key in [k for k in self.rain if k[0] == m]:
+                del self.rain[key]
+            self.centres_xyz.pop(m, None)
+            self.cell_size.pop(m, None)
+            self.models.remove(m)
+            self.order = [x for x in self.order if x != m]
+            for d in (self.runs, self.files, self.grids, self.styles,
+                      self.model_on):
+                d.pop(m, None)
+        self._retime()
         self.show()
 
     # ---- view ----
