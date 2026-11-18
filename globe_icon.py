@@ -3,7 +3,7 @@
 https://opendata.dwd.de/weather/nwp/icon-eu/grib/<HH>/<param>/
     icon-eu_europe_regular-lat-lon_single-level_<YYYYMMDDHH>_<LLL>_<PARAM>.grib2.bz2
 
-Each run hour has its own folder holding only its newest run. Runs
+Each run hour has its own folder holding only its newest run. Only
 every 3 hours; 00, 06, 12 and 18 UTC go to T+120 (hourly to T+78, then
 3-hourly), the others to T+30. Grid: regular lat/lon 0.0625 deg (about
 7 km), 23.5W-62.5E, 29.5-70.5N.
@@ -82,7 +82,7 @@ def latest_run(now=None):
         return t if t <= now else None
 
     with ThreadPoolExecutor(8) as pool:
-        runs = [t for t in pool.map(newest, range(0, 24, 3)) if t]
+        runs = [t for t in pool.map(newest, LONG_RUNS) if t]
     return f"{max(runs):%Y%m%dT%H%MZ}" if runs else None
 
 

@@ -68,7 +68,7 @@ if it did not close cleanly.
 |---|---|---|
 | UKV | 2 km Lambert equal area | Newest run (every 3 h) whose T+54 is published on the Met Office AWS bucket; files come as layers need them |
 | HARMONIE (KNMI) | P3 (deterministic): rotated pole, 0.05 deg (about 5.5 km), Europe | Newest P3 run on the KNMI Open Data API; about 3.4 GB streamed, only the fields drawn are kept (a few minutes to load) |
-| ICON-EU (DWD) | 0.0625 deg lat/lon (about 7 km), 23.5W-62.5E, 29.5-70.5N | Newest run (every 3 h; 00/06/12/18Z to T+120, the others to T+30) whose last file is on opendata.dwd.de; files (bz2 GRIB2, about 1 MB each) come as layers need them |
+| ICON-EU (DWD) | 0.0625 deg lat/lon (about 7 km), 23.5W-62.5E, 29.5-70.5N | Newest 00, 06, 12 or 18Z run (to T+120: hourly to T+78, then 3-hourly) whose T+120 is on opendata.dwd.de; the 03/09/15/21Z runs (to T+30 only) are not used; files (bz2 GRIB2, about 1 MB each) come as layers need them |
 | Global | 10 km lat/lon | Newest run (every 6 h) whose T+54 is published; files come as layers need them (about 6 MB per field per hour) |
 | IBI waves | about 3 km lat/lon, 19W-5E, 26-56N | Copernicus Marine `IBI_ANALYSISFORECAST_WAV_005_005`, today 00Z to +72 h; significant wave height and mean wave direction (arrows point where the waves go) |
 
