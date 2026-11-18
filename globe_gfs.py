@@ -12,7 +12,8 @@ fetched, by HTTP range requests from the ``.idx`` byte offsets:
 
     sflux: 2 m temperature (TMP), 10 m wind (UGRD/VGRD), precipitation
            (PRATE, see below)
-    0.25:  MSLP (PRMSL), CAPE (surface-based), gust (GUST: the
+    0.25:  MSLP (PRMSL), most-unstable CAPE (CAPE 255-0 mb above
+           ground), gust (GUST: the
            instantaneous surface gust; GFS has no hourly maximum gust)
 
 The globe lists the two products as two models, "GFS sflux" and
@@ -42,7 +43,10 @@ AREA = (-80.0, 50.0, 15.0, 80.0)          # west, east, south, north
 SOURCES = {
     "pressure_at_mean_sea_level": ("pgrb2", "PRMSL", "mean sea level", None),
     "temperature_at_screen_level": ("sflux", "TMP", "2 m above ground", None),
-    "CAPE_most_unstable_below_500hPa": ("pgrb2", "CAPE", "surface", None),
+    # Most-unstable CAPE: best parcel in the lowest 255 hPa (as UKV's
+    # and ECMWF's most-unstable CAPE; not surface-based CAPE).
+    "CAPE_most_unstable_below_500hPa": ("pgrb2", "CAPE",
+                                        "255-0 mb above ground", None),
     "wind_gust_at_10m": ("pgrb2", "GUST", "surface", None),
     "u": ("sflux", "UGRD", "10 m above ground", None),
     "v": ("sflux", "VGRD", "10 m above ground", None),
