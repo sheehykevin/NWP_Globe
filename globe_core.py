@@ -714,6 +714,7 @@ class Scene:
         self.failures = {}
         self.rain = {}                          # (model, end, period)
         self.centres_xyz = {}                   # model -> cell centres
+        self.cell_size = {}                     # model -> neighbour angle
         self.lock = threading.Lock()
         self.wake = threading.Event()
         self.dirty = False
@@ -758,6 +759,7 @@ class Scene:
         """Add a loaded model (window thread). Its layers start with the
         viewer's defaults; the time axis grows to cover it."""
         m = lm.model
+        self.cell_size.pop(m, None)
         with self.lock:
             # A model loaded again (after a fetch): forget what was
             # prepared from its earlier files.
@@ -1110,6 +1112,68 @@ class Scene:
             lon, lat = g.lonlat(xx.ravel(), yy.ravel())
             self.centres_xyz[model] = xyz(np.asarray(lon), np.asarray(lat))
         return self.centres_xyz[model]
+
+    def nearest_cell(self, model, lon, lat):
+        """Index (into the model's raveled cells) of the cell centre
+        nearest to lon/lat, or None when the point is off its grid."""
+        pts = self._cell_centres(model)
+        p = xyz(np.asarray([lon], float), np.asarray([lat], float))[0]
+        k = int(np.argmax(pts @ p))
+        if model not in self.cell_size:
+            g = self.grids[model]
+            nx = len(g.x)
+            # Angular spacing between neighbours, along a row and a column.
+            a = np.arccos(np.clip(pts[0] @ pts[1], -1, 1))
+            b = np.arccos(np.clip(pts[0] @ pts[min(nx, len(pts) - 1)],
+                                  -1, 1))
+            self.cell_size[model] = float(np.hypot(a, b))
+        if np.arccos(np.clip(pts[k] @ p, -1, 1)) > self.cell_size[model]:
+            return None
+        return k
+
+    def values_at(self, lon, lat, t=None):
+        """What every switched-on layer shows at lon/lat and time ``t``
+        (default: the shown time): [(model, layer name, text)]."""
+        t = t or self.time
+        out = []
+        for lid in self.layers:
+            if not self.is_on(lid):
+                continue
+            model, name = split_id(lid)
+            style = STYLES[name]
+            if style["kind"] == "centres":
+                continue
+            k = self.nearest_cell(model, lon, lat)
+            if k is None:
+                out.append((model, style["name"], "outside the model"))
+                continue
+            try:
+                if style["kind"] == "raster":
+                    v = self.raster_values(lid, t)
+                    v = None if v is None else float(np.ravel(v)[k])
+                    text = None if v is None else (
+                        "no value here"
+                        if not np.isfinite(v) else
+                        f"{v:{LABEL_FORMAT.get(name, '.1f')}} "
+                        f"{style.get('units', '')}")
+                elif style["kind"] == "isobars":
+                    v = self._field(model, MSLP, t, 0.01)
+                    text = None if v is None else \
+                        f"{float(np.ravel(v)[k]):.1f} hPa"
+                elif style["kind"] == "barbs":
+                    s = self._field(model, WIND, t, MS_TO_KT)
+                    d = self._field(model, WDIR, t)
+                    text = None if s is None or d is None else (
+                        f"{float(np.ravel(s)[k]):.0f} kt from "
+                        f"{float(np.ravel(d)[k]):.0f}\u00b0")
+                else:                                  # wave direction
+                    d = self._field(model, style["param"], t)
+                    text = None if d is None else \
+                        f"{float(np.ravel(d)[k]):.0f}\u00b0"
+            except (OSError, ValueError, IndexError) as exc:
+                text = f"could not read ({exc})"
+            out.append((model, style["name"], text or "not ready"))
+        return out
 
     def update_labels(self, render=True):
         """Label raw cell values of layers with labels on, for the part

@@ -743,11 +743,81 @@ def run_window(args):
     bar.addWidget(status)
     bar.addWidget(status_note)
 
+    # ---- point readout: double-click the globe ----
+    point = dict(lonlat=None, key=None, marker=None)
+    readout = QtWidgets.QLabel()
+    readout.setTextFormat(QtCore.Qt.RichText)
+    readout.setAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
+    readout.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+    readout.setMargin(6)
+    readout_dock = QtWidgets.QDockWidget("Point values", win)
+    readout_dock.setWidget(readout)
+    win.addDockWidget(QtCore.Qt.RightDockWidgetArea, readout_dock)
+    readout_dock.hide()
+
+    def readout_closed(visible):
+        if not visible and point["marker"] is not None:
+            scene.pl.remove_actor(point["marker"], render=True)
+            point.update(lonlat=None, key=None, marker=None)
+    readout_dock.visibilityChanged.connect(readout_closed)
+
+    def picked(pos, *_):
+        import numpy as np
+        p = np.asarray(pos, dtype=float)
+        r = float(np.linalg.norm(p))
+        if r < 0.5 or r > 1.1:                   # not on the globe
+            return
+        p /= r
+        lat = float(np.degrees(np.arcsin(p[2])))
+        lon = float(np.degrees(np.arctan2(p[1], p[0])))
+        point.update(lonlat=(lon, lat), key=None)
+        if point["marker"] is not None:
+            scene.pl.remove_actor(point["marker"], render=False)
+        import pyvista as pv
+        point["marker"] = scene.pl.add_mesh(
+            pv.PolyData(p[None, :] * scene.label_radius()), color="#d01c1c",
+            point_size=11, render_points_as_spheres=True, render=False)
+        readout_dock.show()
+        update_readout(force=True)
+
+    def update_readout(force=False):
+        if point["lonlat"] is None or not scene.times:
+            return
+        key = (point["lonlat"], scene.i,
+               tuple(lid for lid in scene.layers if scene.is_on(lid)))
+        if key == point["key"] and not force:
+            return
+        point["key"] = key
+        lon, lat = point["lonlat"]
+        rows = scene.values_at(lon, lat)
+        ns = "N" if lat >= 0 else "S"
+        ew = "E" if lon >= 0 else "W"
+        html = (f"<b>{abs(lat):.2f}\u00b0{ns} {abs(lon):.2f}\u00b0{ew}</b>"
+                f"<br>{scene.time:%a %d %b %H:%M} UTC<br>")
+        if not rows:
+            html += "<i>Switch layers on to see their values here.</i>"
+        else:
+            html += "<table cellspacing=4>"
+            last = None
+            for model, name, text in rows:
+                label = data.MODELS[model]["label"] if model != last else ""
+                last = model
+                html += (f"<tr><td><b>{label}</b></td><td>{name}</td>"
+                         f"<td align=right>{text}</td></tr>")
+            html += "</table>"
+        html += ("<br><span style='color:#666;font-size:8pt'>Double-click "
+                 "another place to move; close this panel to remove the "
+                 "marker.</span>")
+        readout.setText(html)
+
+    view.track_click_position(picked, side="left", double=True)
+
     last_cam = [None, None]
     shown_progress = [None]
 
     def poll():
         poll_jobs()
+        update_readout()
         # A model finished loading?
         while not done.empty():
             model, result = done.get()
