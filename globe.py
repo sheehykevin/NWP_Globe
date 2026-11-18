@@ -227,8 +227,12 @@ def run_window(args):
 
         def finished(code, _status):
             running.pop(model, None)
-            if last[0] == "DONE":
-                progress[model] = "loading ..."
+            was_stopped = model in stopped
+            stopped.discard(model)
+            if was_stopped and jobs.stored_run(model) is None:
+                progress[model] = "stopped"
+            elif was_stopped or last[0] == "DONE":   # load what is there
+                progress[model] = ("stopped; " if was_stopped else "") +                     "loading ..."
                 run = jobs.stored_run(model)
 
                 def work():
@@ -248,6 +252,20 @@ def run_window(args):
         running[model] = proc
         prog, argv = job_command(model, layers, latest)
         proc.start(prog, argv)
+
+    stopped = set()
+
+    def stop_fetch(model):
+        """Cancel a model's queued and running fetch."""
+        waiting[model].clear()
+        proc = running.get(model)
+        if proc is not None:
+            stopped.add(model)
+            proc.kill()
+        else:
+            progress.pop(model, None)
+        pump()
+        build_items()
 
     def stop_jobs():
         for proc in list(running.values()):
@@ -298,10 +316,18 @@ def run_window(args):
                          + (f"\nLast store change: {last}" if last else ""))
         title.setStyleSheet("font-weight:bold;text-align:left;padding:0")
         get = QtWidgets.QToolButton()
-        get.setIcon(icon)
-        get.setToolTip("Fetch and prepare everything of this model's "
-                       "latest run")
-        get.clicked.connect(lambda _=False, m=model: fetch(m, latest=True))
+        if model in running or waiting[model]:
+            get.setIcon(win.style().standardIcon(
+                QtWidgets.QStyle.SP_MediaStop))
+            get.setToolTip("Stop this model's fetch (hours already "
+                           "prepared are kept)")
+            get.clicked.connect(lambda _=False, m=model: stop_fetch(m))
+        else:
+            get.setIcon(icon)
+            get.setToolTip("Fetch and prepare everything of this model's "
+                           "latest run")
+            get.clicked.connect(lambda _=False, m=model: fetch(m,
+                                                               latest=True))
         head.addWidget(grip)
         head.addWidget(fold)
         head.addWidget(on)

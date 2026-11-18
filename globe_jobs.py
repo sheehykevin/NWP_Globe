@@ -98,6 +98,13 @@ def run_job(model, layers=None, latest=False):
     if not layers:
         _say(f"DONE {model} -")
         return 0
+    # Left over from a fetch that was stopped.
+    for path in glob.glob(os.path.join(core.STORE_CACHE,
+                                       f"{model}_*.part.npz")):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
     old = stored_run(model)
     # Layers already fetched for the stored run: carried over to a newer
     # run, so fetching one layer of a new run does not lose the others.
