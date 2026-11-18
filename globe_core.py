@@ -543,6 +543,12 @@ def _load_item(path):
         return mesh, (pts if len(pts) else None, list(f["label_txt"]))
 
 
+def _lift(points, radius):
+    """Points moved onto the sphere of the given radius."""
+    p = np.asarray(points, dtype=float)
+    return p / np.linalg.norm(p, axis=1, keepdims=True) * radius
+
+
 def _set_opacity(actor, value):
     """Opacity for a mesh actor or a label actor."""
     try:
@@ -665,7 +671,14 @@ class Scene:
         pl.set_background("#0b1020")
         texture = gv.natural_earth_1() if base == "colour" else grey_texture()
         pl.add_base_layer(texture=texture, zlevel=0)
-        pl.add_coastlines(color="black", line_width=1, zlevel=self._z_top())
+        # Heights (GeoVista zlevel steps of 1/10000 of the radius, about
+        # 0.6 km) are given only to layers switched on, packed tightly
+        # (_plan_heights): anything raised far above the globe shifts
+        # sideways towards the edge of the view (parallax).
+        self.raster_z = {}                      # lid -> height drawn at
+        self.z_plan, self.z_top = {}, 2
+        self.coast = None
+        self._place_coastlines()
 
         lon, lat, zoom = ATLANTIC if view == "atlantic" else HOME
         self.go_to(lon, lat, zoom)
@@ -757,22 +770,42 @@ class Scene:
         if render:
             self.pl.render()
 
-    @staticmethod
-    def _z_top():
-        return 2 + 2 * len(RASTERS) * len(MODEL_ORDER) + 2
+    def _plan_heights(self):
+        """Heights for the coloured layers switched on: two steps apart
+        (enough to keep the depth order clear), the lower model's layers
+        below the upper model's; coastlines and lines just above."""
+        on = [lid for lid in self.layers if self.is_on(lid)
+              and STYLES[split_id(lid)[1]]["kind"] == "raster"]
+
+        def bottom_first(lid):
+            model, style = split_id(lid)
+            rank = len(self.order) - 1 - self.order.index(model)
+            return rank, RASTERS.index(style)
+        on.sort(key=bottom_first)
+        self.z_plan = {lid: 2 + 2 * k for k, lid in enumerate(on)}
+        self.z_top = 2 + 2 * len(on)
 
     def _z(self, lid):
-        """Height of a layer: rasters of the upper model above those of
-        the lower one; lines above all rasters. GeoVista heights are
-        whole steps of 1/10000 of the radius (about 0.6 km); two steps
-        apart keeps the depth order clear."""
-        model, style = split_id(lid)
-        rank = len(self.order) - 1 - self.order.index(model)
-        if STYLES[style]["kind"] == "raster":
-            return 2 + 2 * (rank * len(RASTERS) + RASTERS.index(style))
-        return self._z_top() + 2 + {"isobars": 0, "barbs": 10, "arrows": 10,
-                                    "centres": 20}[STYLES[style]["kind"]] \
-            + 2 * rank
+        """Height of a layer (see _plan_heights)."""
+        kind = STYLES[split_id(lid)[1]]["kind"]
+        if kind == "raster":
+            return self.z_plan.get(lid, 2)
+        return self.z_top + {"isobars": 2, "barbs": 3, "arrows": 3,
+                             "centres": 4}[kind]
+
+    def label_radius(self):
+        """Labels sit just above everything drawn."""
+        return 1.0 + (self.z_top + 6) * 1e-4
+
+    def _place_coastlines(self):
+        z = self.z_top + 1
+        if self.coast is not None and getattr(self, "coast_z", None) == z:
+            return
+        if self.coast is not None:
+            self.pl.remove_actor(self.coast, render=False)
+        self.coast = self.pl.add_coastlines(color="black", line_width=1,
+                                            zlevel=z)
+        self.coast_z = z
 
     def _add_raster(self, lid, mesh):
         style = STYLES[split_id(lid)[1]]
@@ -783,18 +816,14 @@ class Scene:
                                  nan_opacity=0.0, show_scalar_bar=False)
         _set_opacity(actor, self.opacity[lid])
         self.rasters[lid] = actor
+        self.raster_z[lid] = self._z(lid)
         return actor
 
     def set_order(self, order, render=True):
         """Models top first; redraws the rasters at their new heights."""
         self.order = [m for m in order if m in self.models] + [
             m for m in self.order if m not in order]
-        for lid, actor in list(self.rasters.items()):
-            mesh = actor.mapper.dataset
-            visible = actor.GetVisibility()
-            self.pl.remove_actor(actor, render=False)
-            self._add_raster(lid, mesh).SetVisibility(visible)
-        self.show(render=render)
+        self.show(render=render)            # re-places the rasters
 
     # ---- time ----
     @property
@@ -1046,7 +1075,7 @@ class Scene:
             chosen = inside[first][:MAX_LABELS * 2]
             fmt = LABEL_FORMAT.get(name, ".0f")
             self.value_actors[lid].append(pl.add_point_labels(
-                pts[chosen] * 1.003,
+                pts[chosen] * self.label_radius(),
                 [format(values[k], fmt) for k in chosen],
                 font_size=9, text_color="#101010", shape=None,
                 show_points=False, always_visible=False, render=False))
@@ -1062,6 +1091,16 @@ class Scene:
 
     def show(self, render=True, block=False):
         pl, t = self.pl, self.time
+        self._plan_heights()
+        self._place_coastlines()
+        # Rasters whose height changed are re-added at the new height.
+        for lid, actor in list(self.rasters.items()):
+            if lid in self.z_plan and self.raster_z.get(lid) != \
+                    self.z_plan[lid]:
+                mesh = actor.mapper.dataset
+                pl.remove_actor(actor, render=False)
+                self._add_raster(lid, mesh)
+        lift = self.label_radius()
         for lid in list(self.layers):
             model, name = split_id(lid)
             style = STYLES[name]
@@ -1100,7 +1139,7 @@ class Scene:
                             if s.startswith(letter)]
                     if keep:
                         self.lines[lid].append(pl.add_point_labels(
-                            np.asarray(pts)[keep],
+                            _lift(np.asarray(pts)[keep], lift),
                             [labels[k].replace(" ", "\n") for k in keep],
                             font_size=15, bold=True, text_color=colour,
                             shape=None, show_points=False,
@@ -1108,7 +1147,8 @@ class Scene:
                             "center", render=False))
             elif pts is not None:
                 self.lines[lid].append(pl.add_point_labels(
-                    pts, labels, font_size=11, text_color=style["colour"],
+                    _lift(pts, lift), labels, font_size=11,
+                    text_color=style["colour"],
                     shape=None, show_points=False, always_visible=False,
                     render=False))
             for actor in self.lines[lid]:
