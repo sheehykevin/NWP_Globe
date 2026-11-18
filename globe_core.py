@@ -38,6 +38,8 @@ from globe_pressure import find_pressure_centres
 
 from globe_paths import APP_DIR as HERE  # next to the exe when built
 CACHE = os.path.join(HERE, "cache")
+# Prepared items of the pre-downloaded runs (globe_prefetch.py).
+PREFETCHED_CACHE = os.path.join(CACHE, "prefetched")
 CACHE_VERSION = 7                   # bump when prepared data changes
 
 RAIN = "precipitation_accumulation"
@@ -543,6 +545,22 @@ def _load_item(path):
         return mesh, (pts if len(pts) else None, list(f["label_txt"]))
 
 
+# Depth-buffer units lines are pulled towards the viewer: enough to win
+# against fills a few height steps below, far too little to show lines
+# through the globe from its far side.
+LINE_OFFSET = float(os.environ.get("GLOBE_LINE_OFFSET", "5000"))
+
+
+def _lines_on_top(actor):
+    """Make a line actor win the depth test against the colour fills just
+    below it: they are only a few hundred metres to a few km apart (kept
+    small so nothing shifts near the edge of the view), which the depth
+    buffer cannot always separate at globe distances."""
+    mapper = actor.GetMapper()
+    mapper.SetResolveCoincidentTopologyToPolygonOffset()
+    mapper.SetRelativeCoincidentTopologyLineOffsetParameters(0.0, -LINE_OFFSET)
+
+
 def _lift(points, radius):
     """Points moved onto the sphere of the given radius."""
     p = np.asarray(points, dtype=float)
@@ -630,7 +648,8 @@ EARTH_KM = 6371.0
 class Scene:
     """All loaded models' layers on one GeoVista plotter."""
 
-    def __init__(self, pl, area="atlantic", base="grey", view="ireland"):
+    def __init__(self, pl, area="atlantic", base="grey", view="ireland",
+                 disk=None, keep_in_memory=True):
         self.pl = pl
         self.area = area
         self.runs, self.files, self.grids, self.styles = {}, {}, {}, {}
@@ -652,9 +671,14 @@ class Scene:
         self.lock = threading.Lock()
         self.wake = threading.Event()
         self.dirty = False
-        self.disk = os.path.join(CACHE, "session")
-        shutil.rmtree(self.disk, ignore_errors=True)
+        # Prepared items are saved in the session cache (deleted on
+        # close); a pre-downloaded cache (PREFETCHED_CACHE) is read too.
+        self.disk = disk or os.path.join(CACHE, "session")
+        if disk is None:
+            shutil.rmtree(self.disk, ignore_errors=True)
         os.makedirs(self.disk, exist_ok=True)
+        self.keep_in_memory = keep_in_memory
+        self.drawing = True
 
         # GeoVista checks the graphics card's opacity support on every
         # add_mesh that sets an opacity (nan_opacity too), by starting
@@ -786,12 +810,12 @@ class Scene:
         kind = STYLES[split_id(lid)[1]]["kind"]
         if kind == "raster":
             return self.z_plan.get(lid, 2)
-        return self.z_top + {"isobars": 2, "barbs": 3, "arrows": 3,
-                             "centres": 4}[kind]
+        return self.z_top + {"isobars": 6, "barbs": 7, "arrows": 7,
+                             "centres": 8}[kind]
 
     def label_radius(self):
         """Labels sit just above everything drawn."""
-        return 1.0 + (self.z_top + 6) * 1e-4
+        return 1.0 + (self.z_top + 10) * 1e-4
 
     def _place_coastlines(self):
         z = self.z_top + 1
@@ -890,12 +914,17 @@ class Scene:
     def prepare(self, lid, t):
         """One layer at one time, from disk if saved, else computed."""
         model = split_id(lid)[0]
-        saved = os.path.join(self.disk, f"{lid.replace(':', '_')}_"
-                                        f"{self.runs[model]}_"
-                                        f"{t:%Y%m%dT%H%MZ}.npz")
-        try:
-            value = _load_item(saved)
-        except (OSError, KeyError, ValueError):
+        name = (f"{lid.replace(':', '_')}_{self.runs[model]}_"
+                f"{t:%Y%m%dT%H%MZ}.npz")
+        saved = os.path.join(self.disk, name)
+        value = None
+        for folder in (self.disk, PREFETCHED_CACHE):
+            try:
+                value = _load_item(os.path.join(folder, name))
+                break
+            except (OSError, KeyError, ValueError):
+                continue
+        else:
             value = self._compute(lid, t)
             if value is not None and not data.CLOSING.is_set():
                 try:
@@ -903,7 +932,9 @@ class Scene:
                 except OSError as exc:
                     print("Could not save", saved, exc)
         with self.lock:
-            self.cache[(lid, t)] = value
+            # Pre-downloading keeps only the saved files, not every item
+            # in memory: True marks the item as done.
+            self.cache[(lid, t)] = value if self.keep_in_memory else True
         return value
 
     def _field(self, model, param, t, scale=1.0, offset=0.0):
@@ -1086,6 +1117,8 @@ class Scene:
             self.show()
 
     def show(self, render=True, block=False):
+        if not getattr(self, "drawing", True):
+            return
         pl, t = self.pl, self.time
         self._plan_heights()
         self._place_coastlines()
@@ -1103,6 +1136,8 @@ class Scene:
             on = self.is_on(lid)
             with self.lock:
                 value = self.cache.get((lid, t), PENDING)
+            if value is True:                # pre-download marker only
+                value = PENDING
             if on and value is PENDING and block:
                 value = self.prepare(lid, t)
             if style["kind"] == "raster":
@@ -1126,9 +1161,11 @@ class Scene:
                 continue
             mesh, (pts, labels) = value
             if mesh.n_points:
-                self.lines[lid].append(pl.add_mesh(
+                actor = pl.add_mesh(
                     mesh.mesh(), color=style["colour"], zlevel=self._z(lid),
-                    line_width=1.5 if style["kind"] == "isobars" else 1.2))
+                    line_width=1.5 if style["kind"] == "isobars" else 1.2)
+                _lines_on_top(actor)
+                self.lines[lid].append(actor)
             if pts is not None and style["kind"] == "centres":
                 for letter, colour in CENTRE_COLOURS.items():
                     keep = [k for k, s in enumerate(labels)

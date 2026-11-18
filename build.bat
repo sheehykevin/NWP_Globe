@@ -70,6 +70,7 @@ if not exist "%BUNDLE%\smoke_test.png" (
     goto :fail
 )
 del "%BUNDLE%\smoke_test.png"
+copy /y prefetch.bat "%BUNDLE%\prefetch.bat" >nul
 
 echo.
 echo Build complete: %CD%\%BUNDLE%

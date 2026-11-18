@@ -30,6 +30,21 @@ conda env create -f environment.yml
 conda run -n ukmo_globe python globe.py
 ```
 
+## Pre-downloading everything
+
+`prefetch.bat` (or `globe.py --prefetch`) fetches the latest run of
+every model (or only those named, e.g. `prefetch.bat ukv global ecmwf`)
+and prepares every layer for every hour, so the globe opens with those
+models already loaded and shows any layer or hour without downloading.
+It is kept in `data\prefetched` and `cache\prefetched` until the next
+pre-download replaces it (a failed pre-download keeps the previous one);
+it is not deleted when the globe closes. A download button still
+fetches a newer run for that session.
+
+All models take of the order of an hour and several GB (HARMONIE alone
+streams 3.4 GB); the summary at the end lists each model's run and time
+and the total size.
+
 ## Standalone build
 
 `build.bat` (in this folder) builds a standalone copy with PyInstaller

@@ -127,6 +127,7 @@ def run_window(args):
     collapsed = {m: False for m in data.MODELS}
     panel_order = list(core.MODEL_ORDER)        # top first, loaded or not
     fetching = {}                               # model -> note text
+    prefetched = set()                          # loaded from a pre-download
     done = queue.Queue()                        # (model, LoadedModel|error)
 
     def model_group(model):
@@ -141,7 +142,8 @@ def run_window(args):
         grip.setStyleSheet("color:#777;font-size:12pt")
         loaded = model in scene.models
         title = data.MODELS[model]["label"] + (
-            f"  {scene.runs[model]}" if loaded else "")
+            f"  {scene.runs[model]}" if loaded else "") + (
+            "  (pre-downloaded)" if loaded and model in prefetched else "")
         on = QtWidgets.QCheckBox(title)
         on.setStyleSheet("font-weight:bold")
         on.setChecked(scene.model_on.get(model, True))
@@ -494,6 +496,21 @@ def run_window(args):
     sync_slider()
     scene.start_workers()
     win.show()
+    import globe_prefetch
+    for model, run in globe_prefetch.manifest().items():
+        if model in data.MODELS:
+            prefetched.add(model)
+            fetching[model] = "Loading the pre-downloaded run ..."
+
+            def work(model=model, run=run):
+                try:
+                    done.put((model, core.load_model(model, run=run,
+                                                     area=args.area)))
+                except Exception as exc:
+                    done.put((model, exc))
+            threading.Thread(target=work, daemon=True).start()
+    if prefetched:
+        build_items()
     for model in args.load:                     # optional, at start
         fetch(model)
     if args.smoke:
@@ -574,10 +591,23 @@ def main():
                     "picture of it and close")
     ap.add_argument("--smoke-wait", type=int, default=8,
                     help="seconds before --smoke saves (default 8)")
+    ap.add_argument("--prefetch", nargs="*", metavar="MODEL",
+                    help="pre-download and prepare the latest run of these "
+                    "models (default: all), kept until the next "
+                    "pre-download; see globe_prefetch.py")
+    ap.add_argument("--prefetch-swap", action="store_true",
+                    help="swap in a complete pre-download whose last step "
+                    "was refused (a folder was open)")
     ap.add_argument("--fetch", nargs=argparse.REMAINDER,
                     help="fetch HARMONIE/IBI/NWS like globe_fetch.py (used "
                     "by the built program's download buttons)")
     args = ap.parse_args()
+    if args.prefetch_swap:
+        import globe_prefetch
+        return globe_prefetch.finish_swap()
+    if args.prefetch is not None:
+        import globe_prefetch
+        return globe_prefetch.run(args.prefetch)
     if args.fetch is not None:
         import globe_fetch
         return globe_fetch.main(args.fetch)

@@ -26,6 +26,10 @@ from datetime import datetime, timedelta, timezone
 
 from globe_paths import APP_DIR as HERE  # next to the exe when built
 DATA = os.path.join(HERE, "data", "session")
+# Pre-downloaded runs (globe_prefetch.py), read only; switched off while
+# a pre-download writes the next one.
+PREFETCHED = os.path.join(HERE, "data", "prefetched")
+READ_PREFETCHED = True
 BUCKET_URL = ("https://met-office-atmospheric-model-data.s3.eu-west-2"
               ".amazonaws.com")
 
@@ -170,6 +174,9 @@ class Files:
     def __init__(self, model, run, archive=None):
         self.model, self.run = model, run
         self.dirs = [os.path.join(DATA, MODELS[model]["dir"], run)]
+        if READ_PREFETCHED:
+            self.dirs.append(os.path.join(PREFETCHED, MODELS[model]["dir"],
+                                          run))
         if archive:
             self.dirs.append(os.path.join(archive, MODELS[model]["dir"], run))
         self.can_download = MODELS[model]["prefix"] is not None
@@ -178,11 +185,12 @@ class Files:
         self.missing = set()     # (parameter, valid, period) not published
         self.inflight = {}       # (parameter, valid, period) -> Event
         self.icon_cache = {}     # ICON raw fields, a few at a time
+        self.expected_cache = {}
         self.downloads = 0
 
     def _scan(self, parameter):
         out = {}
-        for root in reversed(self.dirs):          # session folder wins
+        for root in reversed(self.dirs):    # session folder wins
             for path in glob.glob(os.path.join(root, parameter, "*.nc")):
                 m = NAME.match(os.path.basename(path))
                 if m and m.group(3) == parameter:
@@ -208,6 +216,15 @@ class Files:
                          self.model, parameter, self.run)}
         return keys
 
+    def _expected_cached(self, parameter):
+        with self.lock:
+            hit = self.expected_cache.get(parameter)
+        if hit is None:
+            hit = self.expected(parameter)
+            with self.lock:
+                self.expected_cache[parameter] = hit
+        return hit
+
     def path(self, parameter, valid, period=None, fetch=True):
         """Path of one file, downloading it if needed; None if it is not
         available."""
@@ -216,6 +233,10 @@ class Files:
         if key in held:
             return held[key]
         if not (fetch and self.can_download) or CLOSING.is_set():
+            return None
+        # Only steps the model is used for: no requests at hours a model
+        # does not publish, or beyond its last lead in the globe.
+        if key not in self._expected_cached(parameter):
             return None
         # One download per file: two layers often need the same file at
         # once (MSLP for isobars and for centres); the second waits for
