@@ -157,6 +157,34 @@ def needs(style):
     return [MSLP]
 
 
+def _dashed_graticule(step=10, dash=1.0, gap=1.0):
+    """Meridians and parallels every ``step`` degrees as dashes (``dash``
+    degrees drawn, ``gap`` skipped), just above the base map (zlevel 1).
+    VTK has no dashed line style, so the dashes are separate segments."""
+    from geovista.common import to_cartesian
+    radius = 1.0 + 1e-4
+    pts, cells = [], []
+
+    def add(lons, lats):
+        xyz = to_cartesian(np.asarray(lons, float), np.asarray(lats, float),
+                           radius=radius)
+        n0 = sum(len(p) for p in pts)
+        pts.append(xyz)
+        cells.extend([len(xyz)] + list(range(n0, n0 + len(xyz))))
+
+    sub = 4                                  # points per dash (curvature)
+    for lon in np.arange(-180, 180, step):   # meridians
+        for a in np.arange(-90, 90, dash + gap):
+            lats = np.linspace(a, min(a + dash, 90), sub)
+            add(np.full(sub, lon), lats)
+    for lat in np.arange(-90 + step, 90, step):   # parallels
+        g = (dash + gap) / max(np.cos(np.radians(lat)), 0.2)
+        for a in np.arange(-180, 180, g):
+            lons = np.linspace(a, a + g * dash / (dash + gap), sub)
+            add(lons, np.full(sub, lat))
+    return pv.PolyData(np.vstack(pts), lines=np.array(cells))
+
+
 def capable_styles(model):
     """The layers a model can have, known without any download: from the
     parameters its source publishes."""
@@ -860,13 +888,9 @@ class Scene:
             self.pl.remove_actor(actor, render=False)
         self.graticule = []
         if on:
-            before = set(self.pl.actors)
-            self.pl.add_graticule(lon_step=10, lat_step=10, zlevel=1,
-                                  show_labels=False,
-                                  mesh_args=dict(color="#6a6a6a",
-                                                 line_width=1, opacity=0.6))
-            self.graticule = [a for k, a in self.pl.actors.items()
-                              if k not in before]
+            self.graticule = [self.pl.add_mesh(
+                _dashed_graticule(), color="white", line_width=1.5,
+                render=False)]
         if render:
             self.pl.render()
 
