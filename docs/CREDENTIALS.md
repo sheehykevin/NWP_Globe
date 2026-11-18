@@ -6,6 +6,7 @@ need a free account:
 | Model | Credentials |
 |---|---|
 | UKV, UKMO Global | None (Met Office open data on AWS) |
+| AROME 1.3 km, AROME 2.5 km, AROME-IFS | None (Météo-France open data) |
 | ICON-EU | None (DWD open data) |
 | ECMWF IFS 0.1 | None (ECMWF open data, CC BY 4.0: credit ECMWF) |
 | GFS sflux, GFS 0.25 | None (NOAA open data on AWS) |

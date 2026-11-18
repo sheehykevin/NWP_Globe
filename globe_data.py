@@ -35,6 +35,13 @@ MODELS = {
                 run_hours=range(0, 24, 3), last_lead=54),
     "harmonie": dict(label="HARMONIE (KNMI)", dir="harmonie", prefix=None),
     # DWD open data, file by file (globe_icon.py).
+    # Météo-France open data, package by package (globe_meteofrance.py).
+    "arome_001": dict(label="AROME 1.3 km (Météo-France)", dir="arome_001",
+                      prefix="mf"),
+    "arome_0025": dict(label="AROME 2.5 km (Météo-France)",
+                       dir="arome_0025", prefix="mf"),
+    "aromeifs_0025": dict(label="AROME-IFS 2.5 km (Météo-France)",
+                          dir="aromeifs_0025", prefix="mf"),
     "icon": dict(label="ICON-EU (DWD)", dir="icon", prefix="dwd"),
     # ECMWF open data 0.1 deg, field by field (globe_ecmwf.py).
     "ecmwf": dict(label="ECMWF IFS 0.1", dir="ecmwf", prefix="ecmwf"),
@@ -63,7 +70,10 @@ def stamp(text):
 
 # Models fetched field by field through a module of their own.
 FIELD_SOURCES = {"icon": "globe_icon", "ecmwf": "globe_ecmwf",
-                 "gfs_sflux": "globe_gfs:SFLUX", "gfs_0p25": "globe_gfs:P025"}
+                 "gfs_sflux": "globe_gfs:SFLUX", "gfs_0p25": "globe_gfs:P025",
+                 "arome_001": "globe_meteofrance:AROME_001",
+                 "arome_0025": "globe_meteofrance:AROME_0025",
+                 "aromeifs_0025": "globe_meteofrance:AROMEIFS_0025"}
 
 
 def field_source(model):

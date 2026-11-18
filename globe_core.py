@@ -137,7 +137,8 @@ CLEAR = 255                         # class code: see-through
 PENDING = object()                  # cache marker: not prepared yet
 
 
-MODEL_ORDER = ["ukv", "harmonie", "icon", "ecmwf", "gfs_sflux",
+MODEL_ORDER = ["ukv", "arome_001", "arome_0025", "aromeifs_0025",
+               "harmonie", "icon", "ecmwf", "gfs_sflux",
                "gfs_0p25", "global", "nws", "ibi"]
 WAVES = ("waves", "wave_dir")               # wave models' only layers
 WAVE_MODELS = ("nws", "ibi")
@@ -579,7 +580,9 @@ def _make_grid(model, files, run, area):
             path = next(iter(held.values()))
             break
     if path is None and files.can_download:
-        first = WIND if model == "gfs_sflux" else MSLP
+        # One small file to learn the grid: MSLP, or wind if the model
+        # has no MSLP (GFS sflux, AROME 1.3 km).
+        first = MSLP if files.expected(MSLP) else WIND
         path = files.path(first, data.stamp(run))      # one small file
     if path is None:
         raise RuntimeError(f"No {data.MODELS[model]['label']} files for "
@@ -590,7 +593,8 @@ def _make_grid(model, files, run, area):
         return RotatedGrid(path)
     if model == "global":
         return GlobalGrid(path, AREAS[area])
-    if model in ("icon", "ecmwf", "gfs_sflux", "gfs_0p25"):
+    if model in ("icon", "ecmwf", "gfs_sflux", "gfs_0p25", "arome_001",
+                 "arome_0025", "aromeifs_0025"):
         return GlobalGrid(path, None, wrap=False)
     return GlobalGrid(path, None, wrap=False, km=ARROW_KM)
 

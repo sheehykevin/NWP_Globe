@@ -72,6 +72,9 @@ if it did not close cleanly.
 |---|---|---|
 | UKV | 2 km Lambert equal area | Newest run (every 3 h) whose T+54 is published on the Met Office AWS bucket; files come as layers need them |
 | HARMONIE (KNMI) | P3 (deterministic): rotated pole, 0.05 deg (about 5.5 km), Europe | Newest P3 run on the KNMI Open Data API; about 3.4 GB streamed, only the fields drawn are kept (a few minutes to load) |
+| AROME 1.3 km (Météo-France) | 0.01 deg lat/lon, 12W-16E, 37.5-55.4N | Météo-France open data (data.gouv.fr "Paquets AROME"), newest run (every 3 h, to T+51) whose last file is published; one file per hour per package, fetched as layers need them (SP1 about 23 MB, SP2 about 21 MB) |
+| AROME 2.5 km (Météo-France) | 0.025 deg lat/lon, same domain | As above at 0.025 deg; 6-hour packages (SP1 about 58 MB, SP2 about 49 MB) |
+| AROME-IFS 2.5 km (Météo-France) | 0.025 deg lat/lon, same domain | AROME-IFS packages, newest run (every 6 h, to T+51) |
 | ICON-EU (DWD) | 0.0625 deg lat/lon (about 7 km), 23.5W-62.5E, 29.5-70.5N | Newest 00, 06, 12 or 18Z run (to T+120: hourly to T+78, then 3-hourly) whose T+120 is on opendata.dwd.de; the 03/09/15/21Z runs (to T+30 only) are not used; files (bz2 GRIB2, about 1 MB each) come as layers need them |
 | ECMWF IFS 0.1 | 0.1 deg lat/lon, North Atlantic and Europe block | ECMWF open data (data.ecmwf.int, `0p1/oper`), newest run whose last step is published: 00 and 12Z to T+120, 06 and 18Z to T+90, every 3 hours; only the fields a layer needs are fetched (HTTP range requests on each step's index) |
 | GFS sflux 13 km (NOAA) | T1534 Gaussian (about 13 km), North Atlantic and Europe block | NOAA GFS on AWS (`noaa-gfs-bdp-pds`), newest 00/06/12/18Z run with T+120 published; hourly to T+120; 2 m temperature, 10 m wind (speed, barbs) and rain, fetched by range requests on each step's `.idx` |
@@ -90,6 +93,16 @@ ECMWF has the same layers as UKV except 1-hour rain: its steps are
 accumulation. Its gust is the maximum over the hour before each step to
 T+90 (`10fg`), then over the 3 hours before it (`10fg3`); its CAPE is
 most-unstable CAPE (`mucape`). Data: ECMWF open data, CC BY 4.0.
+
+The three Météo-France models need no account. Their files have no
+byte index, so whole packages are fetched (only those a switched-on
+layer needs; SP2 only for CAPE). CAPE is Météo-France's `CAPE_INS`
+(instantaneous CAPE; the files do not say which parcel). Rain over a
+period is the step in the run accumulation: `tp` at 0.025 deg; at
+0.01 deg rain + snow + graupel (`tirf`, `tsnowp`, `tgrp`) summed. The
+**1.3 km model has no MSLP** (Météo-France publishes only surface
+pressure at 0.01 deg), so no isobars or centres; its gust comes from
+the east/north gust components. The domain ends at 55.4N.
 
 GFS is listed as two models because its two products are on different
 grids (fields from `sflux` where it has them, otherwise from 0.25 deg,
@@ -173,6 +186,7 @@ near-instant.
 | `globe_pressure.py` | High/low centres, copied from the UKMO NWP tools |
 | `globe_icon.py` | ICON-EU (DWD): latest run, fetching and converting files |
 | `globe_ecmwf.py` | ECMWF IFS 0.1 deg open data: latest run, fetching fields |
+| `globe_meteofrance.py` | Météo-France AROME 1.3 / 2.5 km and AROME-IFS: latest run, fetching packages |
 | `globe_gfs.py` | NOAA GFS (sflux and 0.25 deg) on AWS: latest run, fetching fields |
 | `globe_fetch.py` | Fetching HARMONIE (KNMI) and IBI waves (Copernicus Marine) |
 | `globe.py` | The Qt window and the command line |
