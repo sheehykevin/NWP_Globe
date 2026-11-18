@@ -877,7 +877,7 @@ class Scene:
             return
         if self.coast is not None:
             self.pl.remove_actor(self.coast, render=False)
-        self.coast = self.pl.add_coastlines(color="black", line_width=1,
+        self.coast = self.pl.add_coastlines(color="black", line_width=2,
                                             zlevel=z)
         self.coast_z = z
 
@@ -889,7 +889,7 @@ class Scene:
         self.graticule = []
         if on:
             self.graticule = [self.pl.add_mesh(
-                _dashed_graticule(), color="white", line_width=1.5,
+                _dashed_graticule(), color="white", line_width=1,
                 render=False)]
         if render:
             self.pl.render()
