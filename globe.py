@@ -538,6 +538,12 @@ def run_window(args):
     north = bar.addAction("North up")
     north.setToolTip("Turn north back to up (n)")
     north.triggered.connect(lambda: scene.north_up())
+    grid = bar.addAction("Graticule")
+    grid.setCheckable(True)
+    grid.setChecked(True)
+    grid.setToolTip("Latitude / longitude lines every 10°, under the "
+                    "model layers (g)")
+    grid.toggled.connect(lambda v: scene.set_graticule(v))
     bar.addSeparator()
     bar.addWidget(status)
     bar.addWidget(status_note)
@@ -594,7 +600,8 @@ def run_window(args):
                  ("End", lambda: go(len(scene.times) - 1)),
                  ("Space", play_pause),
                  ("H", scene.go_home),
-                 ("N", lambda: scene.north_up()))
+                 ("N", lambda: scene.north_up()),
+                 ("G", grid.toggle))
     for keys, slot in shortcuts:
         sc = QtWidgets.QShortcut(keys, win)
         sc.setContext(QtCore.Qt.ApplicationShortcut)

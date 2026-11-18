@@ -714,6 +714,8 @@ class Scene:
         self.z_plan, self.z_top = {}, 2
         self.coast = None
         self._place_coastlines()
+        self.graticule = []                     # its actors
+        self.set_graticule(True, render=False)
 
         lon, lat, zoom = ATLANTIC if view == "atlantic" else HOME
         self.go_to(lon, lat, zoom)
@@ -850,6 +852,23 @@ class Scene:
         self.coast = self.pl.add_coastlines(color="black", line_width=1,
                                             zlevel=z)
         self.coast_z = z
+
+    def set_graticule(self, on, render=True):
+        """Lines every 10 degrees, just above the base map and under every
+        model layer (rasters start at height 2)."""
+        for actor in self.graticule:
+            self.pl.remove_actor(actor, render=False)
+        self.graticule = []
+        if on:
+            before = set(self.pl.actors)
+            self.pl.add_graticule(lon_step=10, lat_step=10, zlevel=1,
+                                  show_labels=False,
+                                  mesh_args=dict(color="#6a6a6a",
+                                                 line_width=1, opacity=0.6))
+            self.graticule = [a for k, a in self.pl.actors.items()
+                              if k not in before]
+        if render:
+            self.pl.render()
 
     def _add_raster(self, lid, mesh):
         style = STYLES[split_id(lid)[1]]
