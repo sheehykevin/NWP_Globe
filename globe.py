@@ -215,6 +215,27 @@ def run_window(args):
     app.aboutToQuit.connect(stop_jobs)
 
     # ---- layer panel: one group per model, drag to reorder ----
+    def layer_state(model):
+        """({layer: hours prepared in the store}, hours in the run)."""
+        if model not in scene.models:
+            return {}, 0
+        run = scene.runs[model]
+        with scene.lock:
+            params = {p for s in scene.styles[model] for p in core.needs(s)}
+            hours = len({v for p in params
+                         for v, _ in scene.files[model].expected(p)})
+        counts = {}
+        tail = f"_{run}_"
+        try:
+            names = os.listdir(scene.disk)
+        except OSError:
+            names = []
+        for f in names:
+            if f.startswith(model + "_") and tail in f and                     f.endswith(".npz") and not f.endswith(".part.npz"):
+                style = f[len(model) + 1:f.index(tail)]
+                counts[style] = counts.get(style, 0) + 1
+        return counts, hours
+
     def model_group(model):
         box = QtWidgets.QFrame()
         lay = QtWidgets.QVBoxLayout(box)
@@ -262,6 +283,7 @@ def run_window(args):
         rows.setContentsMargins(40, 0, 0, 0)
         rows.setVerticalSpacing(1)
         r = 0
+        prepared, hours = layer_state(model)
         for name in reversed(core.capable_styles(model)):  # top first
             lid = core.layer_id(model, name)
             style = STYLES[name]
@@ -269,8 +291,20 @@ def run_window(args):
             tick = QtWidgets.QCheckBox(style["name"])
             tick.setChecked(has and scene.visible[lid])
             tick.setEnabled(has)
-            if not has:
-                tick.setToolTip("No data yet: press this layer's download "
+            n = prepared.get(name, 0)
+            state = QtWidgets.QLabel()
+            if hours and n >= hours:
+                state.setText("●")
+                state.setStyleSheet("color:#2e9e3e")
+                state.setToolTip(f"Fetched: all {hours} hours ready")
+            elif n:
+                state.setText(f"{n}/{hours}")
+                state.setStyleSheet("color:#c07a00;font-size:8pt")
+                state.setToolTip(f"{n} of {hours} hours ready: press the "
+                                 "download button for the rest")
+            else:
+                tick.setStyleSheet("color:#8a8a8a")
+                tick.setToolTip("Not fetched: press this layer's download "
                                 "button")
             values = QtWidgets.QCheckBox("123")
             values.setToolTip("Label the cells' own values (about 10 km "
@@ -313,8 +347,9 @@ def run_window(args):
             rows.addWidget(values, r, 1)
             rows.addWidget(slider, r, 2)
             rows.addWidget(pct, r, 3)
-            rows.addWidget(one, r, 4)
-            rows.addWidget(key, r + 1, 0, 1, 5)
+            rows.addWidget(state, r, 4)
+            rows.addWidget(one, r, 5)
+            rows.addWidget(key, r + 1, 0, 1, 6)
             r += 2
         body.setVisible(not collapsed[model])
         lay.addWidget(body)
