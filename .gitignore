@@ -6,3 +6,4 @@ reference
 .env
 build/
 dist/
+globe_settings.json

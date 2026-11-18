@@ -101,6 +101,33 @@ def download_icon(QtGui, QtCore, size=18):
     return QtGui.QIcon(pix)
 
 
+def settings_path():
+    from globe_paths import APP_DIR
+    return os.path.join(APP_DIR, "globe_settings.json")
+
+
+def load_settings():
+    """The layout saved when the globe last closed ({} if none)."""
+    import json
+    try:
+        with open(settings_path(), encoding="utf-8") as f:
+            out = json.load(f)
+        return out if isinstance(out, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(values):
+    import json
+    try:
+        tmp = settings_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(values, f, indent=1)
+        os.replace(tmp, settings_path())
+    except OSError:
+        pass
+
+
 def restart_args(argv=None, frozen=None):
     """Arguments to start this window again: the built program gets only
     its options (sys.argv[0] is the exe itself), Python gets the script
@@ -148,8 +175,11 @@ def run_window(args):
     for key in ("Up", "Down"):
         view.clear_events_for_key(key)
 
-    collapsed = {m: True for m in data.MODELS}  # model lists folded
-    panel_order = list(core.MODEL_ORDER)        # top first, loaded or not
+    saved = load_settings()                     # the last session's layout
+    collapsed = {m: saved.get("collapsed", {}).get(m, True)
+                 for m in data.MODELS}          # model lists folded
+    panel_order = [m for m in saved.get("order", []) if m in data.MODELS]
+    panel_order += [m for m in core.MODEL_ORDER if m not in panel_order]
     done = queue.Queue()                        # (model, LoadedModel|error)
     running = {}                                # model -> QProcess
     waiting = {m: [] for m in data.MODELS}      # model -> [(layers, latest)]
@@ -880,6 +910,7 @@ def run_window(args):
                 progress[model] = f"could not load: {result}"[:120]
             else:
                 scene.add_model(result)
+                apply_saved(model)
                 scene.set_order(panel_order)
                 if model not in running and not waiting[model]:
                     progress.pop(model, None)
@@ -913,6 +944,76 @@ def run_window(args):
     poller = QtCore.QTimer(win)
     poller.timeout.connect(poll)
     poller.start(500)
+
+    # ---- the session's layout, kept between runs ----
+    def apply_saved(model):
+        layers = saved.get("layers", {})
+        for lid in scene.layers:
+            if core.split_id(lid)[0] == model and lid in layers:
+                v = layers[lid]
+                scene.visible[lid] = bool(v.get("on", False))
+                scene.opacity[lid] = float(v.get("opacity",
+                                                 scene.opacity[lid]))
+                scene.label_on[lid] = bool(v.get("labels", False))
+        if model in saved.get("model_on", {}):
+            scene.model_on[model] = bool(saved["model_on"][model])
+        scene.wake.set()
+
+    def save_layout():
+        layers = dict(saved.get("layers", {}))  # models not loaded: kept
+        for lid in scene.layers:
+            layers[lid] = dict(on=scene.visible[lid],
+                               opacity=round(scene.opacity[lid], 2),
+                               labels=scene.label_on[lid])
+        cam = scene.pl.camera
+        out = dict(layers=layers, order=panel_order, collapsed=collapsed,
+                   model_on={**saved.get("model_on", {}),
+                             **scene.model_on},
+                   graticule=grid.isChecked(), speed=speed.currentIndex(),
+                   camera=[list(cam.position), list(cam.focal_point),
+                           list(cam.up)],
+                   geometry=bytes(win.saveGeometry().toHex()).decode(),
+                   state=bytes(win.saveState().toHex()).decode())
+        save_settings(out)
+
+    def reset_layout():
+        saved.clear()
+        try:
+            os.remove(settings_path())
+        except OSError:
+            pass
+        for lid in scene.layers:
+            scene.visible[lid] = False
+            scene.opacity[lid] = STYLES[core.split_id(lid)[1]].get(
+                "opacity", 1.0)
+            scene.label_on[lid] = False
+        for m in scene.model_on:
+            scene.model_on[m] = True
+        panel_order[:] = list(core.MODEL_ORDER)
+        collapsed.update({m: True for m in data.MODELS})
+        grid.setChecked(True)
+        speed.setCurrentIndex(2)
+        scene.set_order(panel_order, render=False)
+        scene.go_home()
+        scene.update_labels(render=False)
+        scene.show()
+        build_items()
+    reset = bar.addAction("Reset layout")
+    reset.setToolTip("All layers off, default opacities, model order and "
+                     "view (the layout is otherwise kept between runs)")
+    reset.triggered.connect(reset_layout)
+    app.aboutToQuit.connect(save_layout)
+
+    if "geometry" in saved:
+        win.restoreGeometry(QtCore.QByteArray.fromHex(
+            saved["geometry"].encode()))
+        win.restoreState(QtCore.QByteArray.fromHex(saved["state"].encode()))
+    grid.setChecked(saved.get("graticule", True))
+    speed.setCurrentIndex(saved.get("speed", 2))
+    if saved.get("camera"):
+        cam = scene.pl.camera
+        cam.position, cam.focal_point, cam.up = (
+            tuple(v) for v in saved["camera"])
 
     shortcuts = (("Right", lambda: go(scene.i + 1)),
                  ("Left", lambda: go(scene.i - 1)),
