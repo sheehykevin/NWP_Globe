@@ -9,11 +9,12 @@ need a free account:
 | ICON-EU | None (DWD open data) |
 | ECMWF IFS 0.1 | None (ECMWF open data, CC BY 4.0: credit ECMWF) |
 | GFS sflux, GFS 0.25 | None (NOAA open data on AWS) |
-| HARMONIE (KNMI) | KNMI Open Data API key |
+| HARMONIE (KNMI) | KNMI Open Data API key (works without one: see below) |
 | IBI waves, NWS waves | Copernicus Marine account |
 
-Without them, those three models' download buttons fail with a message
-in the status bar; every other model works as normal.
+HARMONIE works out of the box with KNMI's shared anonymous key (below).
+Without a Copernicus login, the two wave models' download buttons fail
+with a message in the status bar; every other model works as normal.
 
 Credentials are personal: never commit them, email them or paste them
 into issues. Each user gets their own.
@@ -35,8 +36,18 @@ into issues. Each user gets their own.
      "Edit environment variables for your account" > New). Restart the
      globe afterwards. The environment variable wins if both are set.
 
-KNMI's portal also lists a shared anonymous key with low limits; a
-personal key is better for the about 3.4 GB HARMONIE downloads.
+**Getting started without a key:** if no personal key is set, the globe
+uses KNMI's shared **anonymous key**, published on
+https://developer.dataplatform.knmi.nl/open-data-api for unregistered
+use (checked 18 November 2026). It is shared by everyone using it
+(50 requests a minute, 3,000 an hour, across all anonymous users) and is
+valid until **1 August 2027**; KNMI publishes the next one on the same
+page. A HARMONIE fetch makes only two API requests (the 3.4 GB download
+itself comes from a temporary link), so it fits, but a busy period for
+other anonymous users can still make it fail. The status bar says when
+the anonymous key is used. After it expires, copy the new key from that
+page into `ANONYMOUS_KNMI_KEY` and `ANONYMOUS_KNMI_UNTIL` in
+`globe_fetch.py`, or use a personal key.
 
 ## Copernicus Marine account (IBI and NWS waves)
 
@@ -53,9 +64,12 @@ personal key is better for the about 3.4 GB HARMONIE downloads.
    (outside the project, so it is never committed). Nothing else is
    needed; the globe's wave downloads use this file.
 
-Alternative, instead of the login file: set Windows user environment
-variables `COPERNICUSMARINE_SERVICE_USERNAME` and
-`COPERNICUSMARINE_SERVICE_PASSWORD`.
+Alternatives (environment variables read by the toolbox, checked in the
+installed copernicusmarine 2.5.1):
+- `COPERNICUSMARINE_SERVICE_USERNAME` and
+  `COPERNICUSMARINE_SERVICE_PASSWORD` instead of the login file;
+- `COPERNICUSMARINE_CREDENTIALS_DIRECTORY` to keep the login file in
+  another folder.
 
 ## Setting up another user's PC
 

@@ -38,6 +38,10 @@ import globe_data as data
 KNMI_API = "https://api.dataplatform.knmi.nl/open-data/v1"
 # P3: deterministic, 0.05 deg rotated grid (DINI domain), 3.4 GB a run
 # (the P4a ensemble on the same grid is 5.85 GB).
+ANONYMOUS_KNMI_KEY = (
+    "eyJvcmciOiI1ZTU1NGUxOTI3NGE5NjAwMDEyYTNlYjEiLCJpZCI6IjUzYTg1ZDBhMmQ5Yz"
+    "RkYzJiYWNlNzQ4NTQ2Zjk4ODExIiwiaCI6Im11cm11cjEyOCJ9")
+ANONYMOUS_KNMI_UNTIL = datetime(2027, 8, 1)
 KNMI_DATASET = ("harmonie_arome_cy43_p3", "1.0")
 INNER = re.compile(r"_(\d{12})_(\d{3})00_GB", re.I)   # run, lead
 # Copernicus Marine wave models: dataset and box (west, east, south,
@@ -155,8 +159,17 @@ def knmi_key():
                     return value.strip().strip('"').strip("'")
     except OSError:
         pass
-    raise SystemExit("No KNMI API key: set KNMI_API_KEY or put "
-                     "KNMI_API_KEY=... in NWP_Globe/.env")
+    # No personal key: KNMI's shared anonymous key, published for
+    # unregistered use (developer.dataplatform.knmi.nl/open-data-api).
+    # Shared by all anonymous users (50 requests a minute, 3000 an hour);
+    # a fetch makes two API requests. Valid until 1 August 2027; KNMI
+    # publishes its replacement on the same page.
+    if datetime.now() >= ANONYMOUS_KNMI_UNTIL:
+        raise SystemExit("No KNMI API key, and the built-in anonymous "
+                         "key has expired: see docs/CREDENTIALS.md")
+    _say("No personal KNMI API key: using KNMI's shared anonymous key "
+         "(see docs/CREDENTIALS.md)")
+    return ANONYMOUS_KNMI_KEY
 
 
 def _knmi(session, path, **params):
