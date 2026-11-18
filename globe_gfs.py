@@ -169,6 +169,13 @@ def _message(run, source, step, cache, start=None):
 
 
 def _decode(raw):
+    """One GRIB message decoded (one thread at a time: eccodes)."""
+    from globe_paths import GRIB_LOCK
+    with GRIB_LOCK:
+        return _decode_unlocked(raw)
+
+
+def _decode_unlocked(raw):
     import eccodes as ec
     gid = ec.codes_new_from_message(raw)
     try:

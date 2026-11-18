@@ -9,5 +9,10 @@ import os
 import sys
 
 FROZEN = bool(getattr(sys, "frozen", False))
+
+# eccodes is not thread-safe: every GRIB decode in the globe holds this
+# (re-entrant: one decoder may call another).
+import threading  # noqa: E402
+GRIB_LOCK = threading.RLock()
 APP_DIR = (os.path.dirname(os.path.abspath(sys.executable)) if FROZEN
            else os.path.dirname(os.path.abspath(__file__)))

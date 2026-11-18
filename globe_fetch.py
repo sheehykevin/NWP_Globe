@@ -224,7 +224,7 @@ HARMONIE_NEEDS = {
 }
 
 
-DECODE_LOCK = __import__("threading").Lock()
+from globe_paths import GRIB_LOCK as DECODE_LOCK  # noqa: E402
 
 
 def _range(session, url, start, end):

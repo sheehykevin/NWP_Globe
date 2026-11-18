@@ -173,7 +173,7 @@ def run_window(args):
         else:
             waiting[model].append((layers, latest))
         pump()
-        build_items()
+        refresh_all()
 
     def pump():
         """Start queued jobs while fewer than MAX_JOBS run (one per
@@ -257,7 +257,7 @@ def run_window(args):
             progress[model] = ("fetch failed: " + (
                 job["last"] or "it ended without finishing"))[:120]
         pump()
-        build_items()
+        refresh_all()
 
     adopt_tick = [0]
 
@@ -288,7 +288,7 @@ def run_window(args):
         else:
             progress.pop(model, None)
         pump()
-        build_items()
+        refresh_all()
 
     def stop_jobs():
         for m in list(running):
@@ -323,6 +323,7 @@ def run_window(args):
     win.closeEvent = close_event
 
     # ---- layer panel: one group per model, drag to reorder ----
+    ui = {}                          # model -> its group's live widgets
     def layer_state(model):
         """({layer: hours prepared in the store}, hours in the run)."""
         if model not in scene.models:
@@ -365,35 +366,24 @@ def run_window(args):
                          + (f"\nLast store change: {last}" if last else ""))
         title.setStyleSheet("font-weight:bold;text-align:left;padding:0")
         get = QtWidgets.QToolButton()
-        if model in running or waiting[model]:
-            get.setIcon(win.style().standardIcon(
-                QtWidgets.QStyle.SP_MediaStop))
-            get.setToolTip("Stop this model's fetch (hours already "
-                           "prepared are kept)")
-            get.clicked.connect(lambda _=False, m=model: stop_fetch(m))
-        else:
-            get.setIcon(icon)
-            get.setToolTip("Fetch and prepare everything of this model's "
-                           "latest run")
-            get.clicked.connect(lambda _=False, m=model: fetch(m,
-                                                               latest=True))
+        get.clicked.connect(lambda _=False, m=model: header_clicked(m))
+        ui[model] = dict(get=get, rows={})
         head.addWidget(grip)
         head.addWidget(fold)
         head.addWidget(on)
         head.addWidget(title, 1)
         head.addWidget(get)
         lay.addLayout(head)
-        if model in progress:
-            note = QtWidgets.QLabel(progress[model])
-            note.setStyleSheet("color:#2b5fb4;font-size:8pt;margin-left:40px")
-            note.setWordWrap(True)
-            lay.addWidget(note)
+        note = QtWidgets.QLabel()
+        note.setStyleSheet("color:#2b5fb4;font-size:8pt;margin-left:40px")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        ui[model]["note"] = note
         body = QtWidgets.QWidget()
         rows = QtWidgets.QGridLayout(body)
         rows.setContentsMargins(40, 0, 0, 0)
         rows.setVerticalSpacing(1)
         r = 0
-        prepared, hours = layer_state(model)
         for name in reversed(core.capable_styles(model)):  # top first
             lid = core.layer_id(model, name)
             style = STYLES[name]
@@ -401,21 +391,8 @@ def run_window(args):
             tick = QtWidgets.QCheckBox(style["name"])
             tick.setChecked(has and scene.visible[lid])
             tick.setEnabled(has)
-            n = prepared.get(name, 0)
             state = QtWidgets.QLabel()
-            if hours and n >= hours:
-                state.setText("●")
-                state.setStyleSheet("color:#2e9e3e")
-                state.setToolTip(f"Fetched: all {hours} hours ready")
-            elif n:
-                state.setText(f"{n}/{hours}")
-                state.setStyleSheet("color:#c07a00;font-size:8pt")
-                state.setToolTip(f"{n} of {hours} hours ready: press the "
-                                 "download button for the rest")
-            else:
-                tick.setStyleSheet("color:#8a8a8a")
-                tick.setToolTip("Not fetched: press this layer's download "
-                                "button")
+            ui[model]["rows"][name] = (tick, state)
             values = QtWidgets.QCheckBox("123")
             values.setToolTip("Label the cells' own values (about 10 km "
                               "apart when zoomed in)")
@@ -472,7 +449,70 @@ def run_window(args):
             resize_items()
         fold.clicked.connect(fold_clicked)
         title.clicked.connect(fold_clicked)
+        refresh_group(model, resize=False)
         return box
+
+    def header_clicked(model):
+        if model in running or waiting[model]:
+            stop_fetch(model)
+        else:
+            fetch(model, latest=True)
+
+    def refresh_group(model, resize=True):
+        """Bring one model's group up to date in place: progress line,
+        header button, each layer's fetched state."""
+        w = ui.get(model)
+        if not w:
+            return
+        try:
+            _refresh_group(model, w, resize)
+        except RuntimeError:             # widgets dropped by a reorder
+            pass
+
+    def _refresh_group(model, w, resize):
+        text = progress.get(model, "")
+        changed = w["note"].text() != text or w["note"].isVisible() != bool(
+            text)
+        w["note"].setText(text)
+        w["note"].setVisible(bool(text))
+        busy = model in running or bool(waiting[model])
+        if w.get("busy") != busy:
+            w["busy"] = busy
+            if busy:
+                w["get"].setIcon(win.style().standardIcon(
+                    QtWidgets.QStyle.SP_MediaStop))
+                w["get"].setToolTip("Stop this model's fetch (hours "
+                                    "already prepared are kept)")
+            else:
+                w["get"].setIcon(icon)
+                w["get"].setToolTip("Fetch and prepare everything of this "
+                                    "model's latest run")
+        prepared, hours = layer_state(model)
+        for name, (tick, state) in w["rows"].items():
+            n = prepared.get(name, 0)
+            if hours and n >= hours:
+                look = ("●", "color:#2e9e3e",
+                        f"Fetched: all {hours} hours ready", "", None)
+            elif n:
+                look = (f"{n}/{hours}", "color:#c07a00;font-size:8pt",
+                        f"{n} of {hours} hours ready: press the download "
+                        "button for the rest", "", None)
+            else:
+                look = ("", "", "", "color:#8a8a8a",
+                        "Not fetched: press this layer's download button")
+            if state.text() != look[0]:
+                state.setText(look[0])
+                state.setStyleSheet(look[1])
+                state.setToolTip(look[2])
+                tick.setStyleSheet(look[3])
+                tick.setToolTip(look[4] or "")
+        if changed and resize:
+            resize_items()
+
+    def refresh_all():
+        for m in panel_order:
+            refresh_group(m, resize=False)
+        resize_items()
 
     groups = QtWidgets.QListWidget()
     groups.setDragDropMode(QtWidgets.QAbstractItemView.InternalMove)
@@ -480,13 +520,21 @@ def run_window(args):
     groups.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
     groups.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
 
+    def groups_resized(ev, base=groups.resizeEvent):
+        base(ev)
+        QtCore.QTimer.singleShot(0, resize_items)
+    groups.resizeEvent = groups_resized
+
     def resize_items():
         for k in range(groups.count()):
             item = groups.item(k)
             w = groups.itemWidget(item)
             if w is not None:
-                w.adjustSize()
-                item.setSizeHint(w.sizeHint())
+                # Full panel width, so the header button sits at the edge.
+                size = QtCore.QSize(groups.viewport().width(),
+                                    w.sizeHint().height())
+                w.resize(size)
+                item.setSizeHint(size)
 
     def build_items():
         bar_pos = groups.verticalScrollBar().value()
@@ -712,11 +760,14 @@ def run_window(args):
                     progress.pop(model, None)
             build_items()
             sync_slider()
-        # Fetch progress changed: refresh the panel (not too often).
-        snap = tuple(sorted(progress.items()))
-        if snap != shown_progress[0]:
+        # Fetch progress changed: update those groups in place.
+        snap = dict(progress)
+        old = shown_progress[0] or {}
+        if snap != old:
             shown_progress[0] = snap
-            build_items()
+            for m in set(snap) | set(old):
+                if snap.get(m) != old.get(m):
+                    refresh_group(m)
         scene.refresh()
         # Relabel values after the camera has moved and settled.
         cam = tuple(round(v, 4) for v in scene.pl.camera.position)
@@ -733,7 +784,7 @@ def run_window(args):
             text += f", fetching {len(running)} model(s)"
         if scene.label_note and any(scene.label_on.values()):
             text += f", {scene.label_note}"
-        status.setText(text)
+        status.setText("  " + text.strip(" ,") if text else "")
     poller = QtCore.QTimer(win)
     poller.timeout.connect(poll)
     poller.start(500)

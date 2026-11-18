@@ -103,7 +103,13 @@ def _grib(run, lead, param, cache):
             cache[key] = None
             return None
         raise
-    gid = ec.codes_new_from_message(raw)
+    from globe_paths import GRIB_LOCK
+    GRIB_LOCK.acquire()                 # eccodes: one thread at a time
+    try:
+        gid = ec.codes_new_from_message(raw)
+    except Exception:
+        GRIB_LOCK.release()
+        raise
     try:
         g = {k: ec.codes_get(gid, k) for k in (
             "Ni", "Nj", "latitudeOfFirstGridPointInDegrees",
@@ -114,6 +120,7 @@ def _grib(run, lead, param, cache):
         miss = ec.codes_get(gid, "missingValue")
     finally:
         ec.codes_release(gid)
+        GRIB_LOCK.release()
     vals = np.where(vals == miss, np.nan, vals).astype(np.float32)
     lon = g["longitudeOfFirstGridPointInDegrees"] + \
         g["iDirectionIncrementInDegrees"] * np.arange(g["Ni"])
