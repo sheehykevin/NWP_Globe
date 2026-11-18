@@ -69,6 +69,22 @@ def drop_old_cache(model, keep):
                        f"prepared layers; newer run {keep} kept")
 
 
+def prepared_counts(model, run, folder=None):
+    """{layer: hours prepared} of one model run in the store cache."""
+    import globe_core as core
+    folder = folder or core.STORE_CACHE
+    counts, tail = {}, f"_{run}_"
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return counts
+    for f in names:
+        if f.startswith(model + "_") and tail in f and                 f.endswith(".npz") and not f.endswith(".part.npz"):
+            style = f[len(model) + 1:f.index(tail)]
+            counts[style] = counts.get(style, 0) + 1
+    return counts
+
+
 def run_job(model, layers=None, latest=False):
     """Fetch and prepare ``layers`` (default: all the model can have) of
     ``model``. The run: the latest published one when ``latest`` or
@@ -82,8 +98,13 @@ def run_job(model, layers=None, latest=False):
     if not layers:
         _say(f"DONE {model} -")
         return 0
-    params = {p for s in layers for p in core.needs(s)}
-    run = None if latest else stored_run(model)
+    old = stored_run(model)
+    # Layers already fetched for the stored run: carried over to a newer
+    # run, so fetching one layer of a new run does not lose the others.
+    carried = [s for s in prepared_counts(model, old) if s in styles]         if old else []
+    run = None if latest else old
+    fetch_layers = layers + [s for s in carried if s not in layers]         if latest else layers
+    params = {p for s in fetch_layers for p in core.needs(s)}
     try:
         if model == "harmonie":
             hrun = run[:8] + run[9:11] if run else None
@@ -97,8 +118,12 @@ def run_job(model, layers=None, latest=False):
     except (Exception, SystemExit) as exc:
         _say(f"FAILED {model} {exc}")
         return 1
-    data.drop_old_runs(model, lm.run)
-    drop_old_cache(model, lm.run)
+    if old and lm.run != old:
+        extra = [s for s in carried if s not in layers]
+        layers = layers + extra
+        if extra:
+            _say(f"NOTE {model} new run {lm.run[9:11]}Z: refreshing "
+                 f"{len(extra)} layer(s) fetched for {old[9:11]}Z")
 
     pl = gv.GeoPlotter(off_screen=True, window_size=(100, 100))
     scene = core.Scene(pl, keep_in_memory=False)
@@ -122,6 +147,9 @@ def run_job(model, layers=None, latest=False):
             break
         time.sleep(1)
     data.CLOSING.set()                       # stop this job's workers
+    # Older run removed only now: the window shows it until this is done.
+    data.drop_old_runs(model, lm.run)
+    drop_old_cache(model, lm.run)
     _say(f"DONE {model} {lm.run}")
     return 0
 

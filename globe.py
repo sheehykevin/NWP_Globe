@@ -156,6 +156,9 @@ def run_window(args):
     small_icon = download_icon(QtGui, QtCore, 14)
 
     # ---- fetch jobs (separate processes; the store keeps the results) ----
+    # At most MAX_JOBS at once: each has several workers and its own
+    # drawing engine, and the servers ask for modest use.
+    MAX_JOBS = max(1, int(os.environ.get("GLOBE_MAX_JOBS", "2")))
     def job_command(model, layers, latest):
         argv = ["--job", model, *layers] + (["--latest"] if latest else [])
         if getattr(sys, "frozen", False):
@@ -170,11 +173,29 @@ def run_window(args):
                   if s in core.capable_styles(model)]
         if not layers:
             return
-        waiting[model].append((layers, latest))
-        progress[model] = "queued"
-        if model not in running:
-            start_next(model)
+        if waiting[model]:                   # not started: merge into it
+            old_layers, old_latest = waiting[model][0]
+            waiting[model][0] = (old_layers + [s for s in layers
+                                               if s not in old_layers],
+                                 old_latest or latest)
+        else:
+            waiting[model].append((layers, latest))
+        pump()
         build_items()
+
+    def pump():
+        """Start queued jobs while fewer than MAX_JOBS run (one per
+        model, panel order), and number the rest."""
+        for m in panel_order:
+            if len(running) >= MAX_JOBS:
+                break
+            if waiting[m] and m not in running:
+                start_next(m)
+        n = 0
+        for m in panel_order:
+            if waiting[m] and m not in running:
+                n += 1
+                progress[m] = "queued (next)" if n == 1 else                     f"queued ({n} in line)"
 
     def start_next(model):
         if not waiting[model]:
@@ -196,6 +217,8 @@ def run_window(args):
                     progress[model] = f"fetching {names}: {d}/{w}"
                 elif line.startswith("DONE "):
                     last[0] = "DONE"
+                elif line.startswith("NOTE "):
+                    progress[model] = line.split(" ", 2)[2]
                 elif line.startswith("FAILED "):
                     last[0] = line.split(" ", 2)[2]
                 elif line:
@@ -218,8 +241,7 @@ def run_window(args):
             else:
                 progress[model] = ("fetch failed: " + (last[0] or
                                    f"exit code {code}"))[:120]
-            if waiting[model]:
-                start_next(model)
+            pump()
             build_items()
         proc.readyRead.connect(output)
         proc.finished.connect(finished)
@@ -243,16 +265,7 @@ def run_window(args):
             params = {p for s in scene.styles[model] for p in core.needs(s)}
             hours = len({v for p in params
                          for v, _ in scene.files[model].expected(p)})
-        counts = {}
-        tail = f"_{run}_"
-        try:
-            names = os.listdir(scene.disk)
-        except OSError:
-            names = []
-        for f in names:
-            if f.startswith(model + "_") and tail in f and                     f.endswith(".npz") and not f.endswith(".part.npz"):
-                style = f[len(model) + 1:f.index(tail)]
-                counts[style] = counts.get(style, 0) + 1
+        counts = jobs.prepared_counts(model, run, scene.disk)
         return counts, hours
 
     def model_group(model):
