@@ -862,7 +862,79 @@ def run_window(args):
            lambda: go(scene.i + 1))
     button(sp.SP_MediaSkipForward, "Last time (End)",
            lambda: go(len(scene.times) - 1))
-    bar.addWidget(slider)
+    # Under the slider: one segment per time, green where every layer
+    # switched on is ready, grey where something is missing.
+    class ReadyStrip(QtWidgets.QWidget):
+        def __init__(self):
+            super().__init__()
+            self.flags = []
+            self.setFixedHeight(5)
+            self.setToolTip("Green: every layer switched on is ready for "
+                            "that time. Grey: something is not fetched or "
+                            "not prepared yet.")
+
+        def paintEvent(self, _ev):
+            n = len(self.flags)
+            if not n:
+                return
+            qp = QtGui.QPainter(self)
+            # Line the segments up with the slider's groove.
+            pad = slider.style().pixelMetric(
+                QtWidgets.QStyle.PM_SliderLength) // 2
+            w = self.width() - 2 * pad
+            for k, ok in enumerate(self.flags):
+                x0 = pad + int(w * (k - 0.5) / max(n - 1, 1))
+                x1 = pad + int(w * (k + 0.5) / max(n - 1, 1))
+                qp.fillRect(max(x0, 0), 0, max(x1 - x0, 1), 5,
+                            QtGui.QColor("#3aa54a" if ok else "#c8c8c8"))
+            qp.end()
+
+    strip = ReadyStrip()
+    time_box = QtWidgets.QWidget()
+    tb = QtWidgets.QVBoxLayout(time_box)
+    tb.setContentsMargins(0, 2, 0, 0)
+    tb.setSpacing(0)
+    tb.addWidget(slider)
+    tb.addWidget(strip)
+    bar.addWidget(time_box)
+    strip_state = dict(key=None, tick=0)
+
+    def update_strip():
+        """Which times are ready for the layers switched on (in memory or
+        saved prepared), checked every couple of seconds."""
+        strip_state["tick"] += 1
+        on = [lid for lid in scene.layers if scene.is_on(lid)]
+        key = (tuple(on), len(scene.times), strip_state["tick"] // 4)
+        if key == strip_state["key"]:
+            return
+        strip_state["key"] = key
+        try:
+            names = set(os.listdir(scene.disk)) if on else set()
+        except OSError:
+            names = set()
+        flags = []
+        with scene.lock:
+            has = {}                     # lid -> times its model publishes
+            for lid in on:
+                m, s = core.split_id(lid)
+                has[lid] = {v for p in core.needs(s)
+                            for v, _ in scene.files[m].expected(p)}
+            for tt in scene.times:
+                ok = bool(on)
+                for lid in on:
+                    if tt not in has[lid]:
+                        continue
+                    if (lid, tt) in scene.cache and \
+                            scene.cache[(lid, tt)] is not None:
+                        continue
+                    run = scene.runs[core.split_id(lid)[0]]
+                    if (f"{lid.replace(':', '_')}_{run}_"
+                            f"{tt:%Y%m%dT%H%MZ}.npz") not in names:
+                        ok = False
+                        break
+                flags.append(ok)
+        strip.flags = flags if on else []
+        strip.update()
     slider.valueChanged.connect(go)
     speed = QtWidgets.QComboBox()
     for text, ms in (("0.5 /s", 2000), ("1 /s", 1000), ("2 /s", 500),
@@ -991,6 +1063,7 @@ def run_window(args):
 
     def poll():
         poll_jobs()
+        update_strip()
         if size_ready.is_set():
             size_ready.clear()
             update_store_label()
