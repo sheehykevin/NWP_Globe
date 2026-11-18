@@ -202,6 +202,29 @@ def xyz(lon, lat):
                             np.sin(phi)]).astype(np.float32)
 
 
+class Lines:
+    """Line segments as plain arrays (VTK cell layout). Workers make
+    these; VTK objects are made only on the window thread (``mesh``),
+    because VTK is not safe to use from two threads at once."""
+
+    def __init__(self, points=None, lines=None, hpa=None):
+        self.points = (np.zeros((0, 3), np.float32) if points is None
+                       else np.asarray(points, np.float32))
+        self.lines = (np.zeros(0, np.int64) if lines is None
+                      else np.asarray(lines, np.int64))
+        self.hpa = None if hpa is None else np.asarray(hpa, np.float32)
+
+    @property
+    def n_points(self):
+        return len(self.points)
+
+    def mesh(self):
+        m = pv.PolyData(self.points.copy(), lines=self.lines.copy())
+        if self.hpa is not None:
+            m.point_data["hPa"] = self.hpa
+        return m
+
+
 def isobar_mesh(x, y, hpa, to_lonlat=None, wrap=False):
     """Isobars as lines on the globe, contoured on the model's own grid.
 
@@ -224,13 +247,11 @@ def isobar_mesh(x, y, hpa, to_lonlat=None, wrap=False):
             vals.append(np.full(len(line), level, dtype=np.float32))
             n += len(line)
     if not pts:
-        return pv.PolyData()
+        return Lines()
     xy = np.concatenate(pts)
     lon, lat = (to_lonlat(xy[:, 0], xy[:, 1]) if to_lonlat
                 else (xy[:, 0], xy[:, 1]))
-    mesh = pv.PolyData(xyz(lon, lat), lines=np.concatenate(cells))
-    mesh.point_data["hPa"] = np.concatenate(vals)
-    return mesh
+    return Lines(xyz(lon, lat), np.concatenate(cells), np.concatenate(vals))
 
 
 def isobar_labels(isobars, spacing=0.12):
@@ -240,7 +261,7 @@ def isobar_labels(isobars, spacing=0.12):
     if isobars.n_points == 0:
         return None, []
     pts = isobars.points
-    hpa = isobars.point_data["hPa"]
+    hpa = isobars.hpa
     box = np.floor(pts / spacing).astype(np.int64)
     off = np.sum((pts / spacing - box - 0.5) ** 2, axis=1)
     key = np.column_stack([box, np.rint(hpa).astype(np.int64)])
@@ -268,7 +289,7 @@ def barb_mesh(lon, lat, knots, from_deg, length=BARB_LENGTH):
     is drawn."""
     ok = np.isfinite(knots) & np.isfinite(from_deg) & (knots >= 2.5)
     if not ok.any():
-        return pv.PolyData()
+        return Lines()
     lam, phi = np.radians(lon[ok]), np.radians(lat[ok])
     d = np.radians(from_deg[ok])[:, None]
     east = np.column_stack([-np.sin(lam), np.cos(lam), np.zeros_like(lam)])
@@ -303,7 +324,7 @@ def barb_mesh(lon, lat, knots, from_deg, length=BARB_LENGTH):
     n = len(a)
     lines = np.column_stack([np.full(n, 2), 2 * np.arange(n),
                              2 * np.arange(n) + 1]).ravel()
-    return pv.PolyData(pts, lines=lines)
+    return Lines(pts, lines)
 
 
 def arrow_mesh(lon, lat, from_deg, length=0.004):
@@ -311,7 +332,7 @@ def arrow_mesh(lon, lat, from_deg, length=0.004):
     of a "from" direction), all the same length."""
     ok = np.isfinite(from_deg)
     if not ok.any():
-        return pv.PolyData()
+        return Lines()
     lam, phi = np.radians(lon[ok]), np.radians(lat[ok])
     d = np.radians(from_deg[ok] + 180.0)[:, None]
     east = np.column_stack([-np.sin(lam), np.cos(lam), np.zeros_like(lam)])
@@ -330,7 +351,7 @@ def arrow_mesh(lon, lat, from_deg, length=0.004):
     n = len(a)
     lines = np.column_stack([np.full(n, 2), 2 * np.arange(n),
                              2 * np.arange(n) + 1]).ravel()
-    return pv.PolyData(pts, lines=lines)
+    return Lines(pts, lines)
 
 
 def _latlon_cut(x, y, km, deg=True):
@@ -497,10 +518,10 @@ def _save_item(path, value):
         out = {"raster": value}
     else:
         mesh, (pts, txt) = value
-        out = {"points": np.asarray(mesh.points, dtype=np.float32),
-               "lines": np.asarray(mesh.lines, dtype=np.int32),
-               "hpa": np.asarray(mesh.point_data.get("hPa", []),
-                                 dtype=np.float32),
+        out = {"points": mesh.points,
+               "lines": mesh.lines,
+               "hpa": (np.zeros(0, np.float32) if mesh.hpa is None
+                       else mesh.hpa),
                "label_pts": (np.zeros((0, 3), np.float32) if pts is None
                              else np.asarray(pts, np.float32)),
                "label_txt": np.array(txt, dtype="U16")}
@@ -513,11 +534,8 @@ def _load_item(path):
     with np.load(path) as f:
         if "raster" in f:
             return f["raster"]
-        mesh = pv.PolyData()
-        if f["points"].size:
-            mesh = pv.PolyData(f["points"], lines=f["lines"])
-            if f["hpa"].size:
-                mesh.point_data["hPa"] = f["hpa"]
+        mesh = Lines(f["points"], f["lines"],
+                     f["hpa"] if f["hpa"].size else None)
         pts = f["label_pts"]
         return mesh, (pts if len(pts) else None, list(f["label_txt"]))
 
@@ -609,6 +627,7 @@ class Scene:
         self.label_note = ""
         self.cache = {}                         # (lid, t) -> item or None
         self.claimed = set()
+        self.failures = {}
         self.rain = {}                          # (model, end, period)
         self.centres_xyz = {}                   # model -> cell centres
         self.lock = threading.Lock()
@@ -822,7 +841,9 @@ class Scene:
             except Exception as exc:            # keep the window usable
                 print("Could not prepare", job, exc)
                 with self.lock:
-                    self.cache[job] = None
+                    self.failures[job] = self.failures.get(job, 0) + 1
+                    if self.failures[job] >= 3:
+                        self.cache[job] = None
             with self.lock:
                 self.claimed.discard(job)
             if job[1] == self.time:
@@ -942,11 +963,11 @@ class Scene:
             found = find_pressure_centres(hpa, grid.x, grid.y,
                                           crs=grid.crs)
         if not found:
-            return pv.PolyData(), (None, [])
+            return Lines(), (None, [])
         lon, lat = grid.lonlat([c["x"] for c in found],
                                [c["y"] for c in found])
         pts = xyz(np.asarray(lon), np.asarray(lat)) * 1.007
-        return pv.PolyData(), (pts, [f"{c['letter']} {c['pressure']:.0f}"
+        return Lines(), (pts, [f"{c['letter']} {c['pressure']:.0f}"
                                      for c in found])
 
     # ---- value labels ----
@@ -1058,7 +1079,7 @@ class Scene:
             mesh, (pts, labels) = value
             if mesh.n_points:
                 self.lines[lid].append(pl.add_mesh(
-                    mesh, color=style["colour"], zlevel=self._z(lid),
+                    mesh.mesh(), color=style["colour"], zlevel=self._z(lid),
                     line_width=1.5 if style["kind"] == "isobars" else 1.2))
             if pts is not None and style["kind"] == "centres":
                 for letter, colour in CENTRE_COLOURS.items():

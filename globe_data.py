@@ -135,6 +135,7 @@ class Files:
         self.lock = threading.Lock()
         self.found = {}          # parameter -> {(valid, period): path}
         self.missing = set()     # (parameter, valid, period) not published
+        self.inflight = {}       # (parameter, valid, period) -> Event
         self.downloads = 0
 
     def _scan(self, parameter):
@@ -174,10 +175,24 @@ class Files:
             return held[key]
         if not (fetch and self.can_download) or CLOSING.is_set():
             return None
+        # One download per file: two layers often need the same file at
+        # once (MSLP for isobars and for centres); the second waits for
+        # the first instead of downloading into the same temporary file.
+        job = (parameter, valid, period)
         with self.lock:
-            if (parameter, valid, period) in self.missing:
+            if job in self.missing:
                 return None
-        return self._download(parameter, valid, period)
+            wait = self.inflight.get(job)
+            if wait is None:
+                self.inflight[job] = threading.Event()
+        if wait is not None:
+            wait.wait(120)
+            return self.held(parameter).get(key)
+        try:
+            return self._download(parameter, valid, period)
+        finally:
+            with self.lock:
+                self.inflight.pop(job).set()
 
     def _download(self, parameter, valid, period):
         name = file_name(self.run, parameter, valid, period)
