@@ -24,7 +24,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+from globe_paths import APP_DIR as HERE  # next to the exe when built
 DATA = os.path.join(HERE, "data", "session")
 BUCKET_URL = ("https://met-office-atmospheric-model-data.s3.eu-west-2"
               ".amazonaws.com")

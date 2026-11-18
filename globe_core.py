@@ -36,7 +36,7 @@ from pyproj import CRS, Transformer
 import globe_data as data
 from globe_pressure import find_pressure_centres
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+from globe_paths import APP_DIR as HERE  # next to the exe when built
 CACHE = os.path.join(HERE, "cache")
 CACHE_VERSION = 7                   # bump when prepared data changes
 
@@ -656,18 +656,14 @@ class Scene:
         shutil.rmtree(self.disk, ignore_errors=True)
         os.makedirs(self.disk, exist_ok=True)
 
-        # GeoVista checks the graphics card's opacity support (about
-        # 1.4 s, by starting a program) on every add_mesh that sets an
-        # opacity, including nan_opacity. Once per window is enough.
-        check = getattr(pl, "_warn_opacity", None)
-        if check is not None:
-            done = []
-
-            def check_once():
-                if not done:
-                    done.append(True)
-                    check()
-            pl._warn_opacity = check_once
+        # GeoVista checks the graphics card's opacity support on every
+        # add_mesh that sets an opacity (nan_opacity too), by starting
+        # sys.executable as a Python process (about 1.4 s each). Built
+        # with PyInstaller, sys.executable is the globe itself, so the
+        # check starts a second globe and fails. It only adds a warning
+        # for a few old graphics cards: switch it off.
+        if hasattr(pl, "_warn_opacity"):
+            pl._warn_opacity = lambda: None
         pl.set_background("#0b1020")
         texture = gv.natural_earth_1() if base == "colour" else grey_texture()
         pl.add_base_layer(texture=texture, zlevel=0)

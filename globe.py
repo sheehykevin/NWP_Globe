@@ -310,9 +310,13 @@ def run_window(args):
         proc.finished.connect(finished)
         procs[model] = proc
         what = model                 # harmonie, ibi or nws
-        proc.start(sys.executable, [
-            os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         "globe_fetch.py"), what])
+        if getattr(sys, "frozen", False):   # built: the console program
+            proc.start(os.path.join(os.path.dirname(sys.executable),
+                                    "nwp-globe-fetch.exe"), ["--fetch", what])
+        else:
+            proc.start(sys.executable, [
+                os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "globe_fetch.py"), what])
 
     def stop_fetches():
         for proc in procs.values():
@@ -570,7 +574,13 @@ def main():
                     "picture of it and close")
     ap.add_argument("--smoke-wait", type=int, default=8,
                     help="seconds before --smoke saves (default 8)")
+    ap.add_argument("--fetch", nargs=argparse.REMAINDER,
+                    help="fetch HARMONIE/IBI/NWS like globe_fetch.py (used "
+                    "by the built program's download buttons)")
     args = ap.parse_args()
+    if args.fetch is not None:
+        import globe_fetch
+        return globe_fetch.main(args.fetch)
     if args.screenshot:
         run_screenshot(args)
         return 0
