@@ -25,11 +25,11 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 
 from globe_paths import APP_DIR as HERE  # next to the exe when built
-DATA = os.path.join(HERE, "data", "session")
-# Pre-downloaded runs (globe_prefetch.py), read only; switched off while
-# a pre-download writes the next one.
-PREFETCHED = os.path.join(HERE, "data", "prefetched")
-READ_PREFETCHED = True
+# The store: every model's newest fetched run, kept until a newer run of
+# that model is fetched or the store is cleared (globe_jobs.py).
+DATA = os.path.join(HERE, "data", "store")
+# Downloads are made by fetch jobs; the window only reads the store.
+ALLOW_DOWNLOAD = True
 BUCKET_URL = ("https://met-office-atmospheric-model-data.s3.eu-west-2"
               ".amazonaws.com")
 
@@ -137,7 +137,7 @@ def latest_run(model, now=None, back_hours=48):
 
 
 def held_runs(model):
-    """Runs of a model already in the session folder, oldest first."""
+    """Runs of a model in the store, oldest first."""
     try:
         runs = os.listdir(os.path.join(DATA, MODELS[model]["dir"]))
     except OSError:
@@ -150,11 +150,39 @@ ACTIVE = [0]                       # downloads in progress
 ACTIVE_LOCK = threading.Lock()
 
 
+def drop_old_runs(model, keep):
+    """Delete a model's runs in the store other than ``keep``."""
+    for run in held_runs(model):
+        if run != keep:
+            shutil.rmtree(os.path.join(DATA, MODELS[model]["dir"], run),
+                          ignore_errors=True)
+
+
+def migrate():
+    """Move data from the older layout (data/prefetched, data/session)
+    into the store, once."""
+    old = os.path.join(HERE, "data", "prefetched")
+    if os.path.isdir(old):
+        for model in MODELS:
+            src = os.path.join(old, MODELS[model]["dir"])
+            if not os.path.isdir(src):
+                continue
+            for run in os.listdir(src):
+                dst = os.path.join(DATA, MODELS[model]["dir"], run)
+                if not os.path.exists(dst):
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    try:
+                        os.replace(os.path.join(src, run), dst)
+                    except OSError:
+                        pass
+        shutil.rmtree(old, ignore_errors=True)
+    shutil.rmtree(os.path.join(HERE, "data", "session"), ignore_errors=True)
+
+
 def clear_session(wait=0.0):
-    """Delete everything downloaded in this (or a crashed) session.
+    """Delete the whole store (the "Clear downloaded data" action).
     With ``wait``, first stop downloads (those in flight abort) and wait
-    up to that long for them, so nothing is written after the folder is
-    gone."""
+    up to that long for them."""
     import time
     if wait:
         CLOSING.set()
@@ -174,9 +202,6 @@ class Files:
     def __init__(self, model, run, archive=None):
         self.model, self.run = model, run
         self.dirs = [os.path.join(DATA, MODELS[model]["dir"], run)]
-        if READ_PREFETCHED:
-            self.dirs.append(os.path.join(PREFETCHED, MODELS[model]["dir"],
-                                          run))
         if archive:
             self.dirs.append(os.path.join(archive, MODELS[model]["dir"], run))
         self.can_download = MODELS[model]["prefix"] is not None
@@ -232,7 +257,8 @@ class Files:
         held = self.held(parameter)
         if key in held:
             return held[key]
-        if not (fetch and self.can_download) or CLOSING.is_set():
+        if not (fetch and self.can_download and ALLOW_DOWNLOAD) or \
+                CLOSING.is_set():
             return None
         # Only steps the model is used for: no requests at hours a model
         # does not publish, or beyond its last lead in the globe.

@@ -1,13 +1,13 @@
 @echo off
-rem Pre-download and prepare the latest run of every model (or those named),
-rem kept until the next pre-download: the globe then opens with them loaded.
-rem   prefetch.bat                  all models
-rem   prefetch.bat ukv global ecmwf only these
+rem Fetch and prepare the latest run of every model (or those named) into the
+rem store, kept until a newer run is fetched: the globe opens with them loaded.
+rem   prefetch.bat                               all models, all layers
+rem   prefetch.bat ukv global ecmwf              only these models
+rem   prefetch.bat ecmwf --layers rain_6h mslp   only these layers
 setlocal
 set "ROOT=%~dp0"
 cd /d "%ROOT%"
 set "ARGS=--prefetch %*"
-if /i "%~1"=="--prefetch-swap" set "ARGS=--prefetch-swap"
 if exist "%ROOT%nwp-globe-fetch.exe" (
     "%ROOT%nwp-globe-fetch.exe" %ARGS%
 ) else (

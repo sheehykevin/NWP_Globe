@@ -27,7 +27,6 @@ import os
 import re
 import shutil
 import sys
-import tarfile
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -215,9 +214,90 @@ def _grid_of(gid, ec):
     return x, y, attrs
 
 
-def fetch_harmonie(run=None):
+# Our parameter -> the HARMONIE fields (HARMONIE_FIELDS names) it needs.
+HARMONIE_NEEDS = {
+    "pressure_at_mean_sea_level": {"mslp"},
+    "temperature_at_screen_level": {"t2m"},
+    "wind_speed_at_10m": {"u10", "v10"},
+    "wind_direction_at_10m": {"u10", "v10"},
+    "wind_gust_at_10m": {"ugust", "vgust"},
+    "precipitation_accumulation": {"tp_acc"},
+}
+
+
+DECODE_LOCK = __import__("threading").Lock()
+
+
+def _range(session, url, start, end):
+    """Bytes start..end (inclusive) of a file, by an HTTP range request."""
+    for attempt in range(4):
+        try:
+            r = session.get(url, headers={"Range": f"bytes={start}-{end}"},
+                            timeout=120)
+            if r.status_code == 206:
+                return r.content
+            r.raise_for_status()
+            raise OSError(f"range not honoured (HTTP {r.status_code})")
+        except Exception:
+            if attempt == 3:
+                raise
+            import time
+            time.sleep(2 * (attempt + 1))
+
+
+def _tar_members(session, url, total):
+    """(name, data offset, size) of each file in a TAR, read from its
+    512-byte headers only (PAX / GNU long names handled)."""
+    out, off, pending = [], 0, None
+    while off + 512 <= total:
+        hdr = _range(session, url, off, off + 511)
+        if not hdr.strip(b"\0"):
+            break
+        name = hdr[0:100].rstrip(b"\0").decode("utf-8", "replace")
+        size = int(hdr[124:136].strip(b"\0 ") or b"0", 8)
+        kind = hdr[156:157]
+        data = off + 512
+        if kind in (b"x", b"g", b"L"):
+            body = _range(session, url, data, data + size - 1)
+            if kind == b"L":
+                pending = body.rstrip(b"\0").decode("utf-8", "replace")
+            elif kind == b"x":
+                for rec in body.decode("utf-8", "replace").splitlines():
+                    if " path=" in rec:
+                        pending = rec.split(" path=", 1)[1]
+        elif kind in (b"0", b"\0"):
+            out.append((pending or name, data, size))
+            pending = None
+        off = data + ((size + 511) // 512) * 512
+    return out
+
+
+def _grib1_index(session, url, start, size):
+    """(key, offset, length) of each GRIB1 message in a TAR member, from
+    the first 32 bytes of each: key = (parameter, level type, level,
+    time range indicator)."""
+    out, pos, end = [], start, start + size
+    while pos + 32 <= end:
+        head = _range(session, url, pos, pos + 31)
+        if head[:4] != b"GRIB":
+            break
+        length = int.from_bytes(head[4:7], "big")
+        key = (head[16], head[17], int.from_bytes(head[18:20], "big"),
+               head[28])
+        out.append((key, pos, length))
+        pos += length
+    return out
+
+
+def fetch_harmonie(run=None, params=None):
+    """Fetch a HARMONIE P3 run (default: newest), only the fields the
+    given parameters need (default: all the globe uses). The TAR is
+    never downloaded whole: its member headers and each GRIB message's
+    first bytes are read with HTTP range requests, then only the wanted
+    messages are fetched (a few hundred MB instead of 3.4 GB)."""
     import eccodes as ec
     import requests
+    from concurrent.futures import ThreadPoolExecutor
     session = requests.Session()
     session.headers["Authorization"] = knmi_key()
     if run:
@@ -232,53 +312,63 @@ def fetch_harmonie(run=None):
         name = names[0]
     run_time = datetime.strptime(re.search(r"(\d{10})", name).group(1),
                                  "%Y%m%d%H")
-    url = _knmi(session, f"/files/{name}/url")["temporaryDownloadUrl"]
-    _say(f"HARMONIE {name}: streaming (about 3.4 GB); keeping the "
-         "fields the globe draws ...")
+    info = _knmi(session, f"/files/{name}/url")
+    url = info["temporaryDownloadUrl"]
+    plain = requests.Session()               # the temporary link: no key
+    first = plain.get(url, headers={"Range": "bytes=0-0"}, timeout=60)
+    total = int(first.headers["Content-Range"].rsplit("/", 1)[1])
+    wanted_names = set().union(*(HARMONIE_NEEDS[p] for p in (
+        params or HARMONIE_NEEDS) if p in HARMONIE_NEEDS))
+    wanted = {k: v for k, v in HARMONIE_FIELDS.items() if v in wanted_names}
+    _say(f"HARMONIE {name}: reading the archive's index "
+         f"({total / 1e9:.1f} GB, fetching only "
+         f"{', '.join(sorted(wanted_names))}) ...")
+    members = [(INNER.search(n), off, size)
+               for n, off, size in _tar_members(plain, url, total)]
+    members = [(int(m.group(2)), off, size) for m, off, size in members if m]
+    if not members:
+        raise SystemExit("No forecast files found in the archive")
+    with ThreadPoolExecutor(16) as pool:
+        indexes = list(pool.map(
+            lambda m: (m[0], _grib1_index(plain, url, m[1], m[2])), members))
     inventory = {}
-    acc_prev = {}
-    grid = None
-    seen = 0
-    with requests.get(url, stream=True, timeout=120) as r:
-        r.raise_for_status()
-        r.raw.decode_content = True
-        with tarfile.open(fileobj=r.raw, mode="r|*") as tar:
-            for member in tar:
-                m = INNER.search(member.name)
-                if not (member.isfile() and m):
-                    continue
-                lead = int(m.group(2))
-                buf = tar.extractfile(member).read()
-                seen += 1
-                fields = {}
-                for msg in _grib_messages(buf):
-                    gid = ec.codes_new_from_message(msg)
-                    try:
-                        # As numbers: plain codes_get gives level type
-                        # names ("sfc") instead of the codes.
-                        key = tuple(ec.codes_get_long(gid, k) for k in (
-                            "indicatorOfParameter", "indicatorOfTypeOfLevel",
-                            "level", "timeRangeIndicator"))
-                        inventory.setdefault(key[:3], set()).add(key[3])
-                        if key in HARMONIE_FIELDS:
-                            if grid is None:
-                                grid = _grid_of(gid, ec)
-                            ni = ec.codes_get(gid, "Ni")
-                            nj = ec.codes_get(gid, "Nj")
-                            vals = ec.codes_get_values(gid).reshape(nj, ni)
-                            miss = ec.codes_get(gid, "missingValue")
-                            vals = np.where(vals == miss, np.nan, vals)
-                            fields[HARMONIE_FIELDS[key]] = vals
-                    finally:
-                        ec.codes_release(gid)
-                _store_harmonie(run_time, lead, fields, grid, acc_prev)
-                _say(f"  T+{lead}: {', '.join(sorted(fields)) or 'none'}")
+    for _, msgs in indexes:
+        for key, _, _ in msgs:
+            inventory.setdefault(key[:3], set()).add(key[3])
+    got = [0]
+
+    def fields_of(lead_msgs):
+        lead, msgs = lead_msgs
+        fields, grid = {}, None
+        for key, off, length in msgs:
+            if key not in wanted:
+                continue
+            raw = _range(plain, url, off, off + length - 1)
+            got[0] += length
+            with DECODE_LOCK:              # eccodes: one thread at a time
+                gid = ec.codes_new_from_message(raw)
+                try:
+                    grid = grid or _grid_of(gid, ec)
+                    ni, nj = ec.codes_get(gid, "Ni"), ec.codes_get(gid, "Nj")
+                    vals = ec.codes_get_values(gid).reshape(nj, ni)
+                    miss = ec.codes_get(gid, "missingValue")
+                    fields[wanted[key]] = np.where(vals == miss, np.nan,
+                                                   vals)
+                finally:
+                    ec.codes_release(gid)
+        return lead, fields, grid
+
+    acc_prev, grid = {}, None
+    with ThreadPoolExecutor(8) as pool:
+        for lead, fields, g in pool.map(fields_of, sorted(indexes)):
+            grid = grid or g
+            _store_harmonie(run_time, lead, fields, grid, acc_prev)
+            _say(f"  T+{lead}: {', '.join(sorted(fields)) or 'none'}")
     _store_precip(run_time, acc_prev, grid)
     _write_inventory(name, inventory)
-    if not seen:
-        raise SystemExit("No forecast files found in the archive")
     _prune("harmonie")
-    _say("HARMONIE done:", f"{run_time:%Y%m%dT%H%MZ}")
+    _say(f"HARMONIE done: {run_time:%Y%m%dT%H%MZ} "
+         f"({got[0] / 1e6:.0f} MB fetched of {total / 1e9:.1f} GB)")
 
 
 def _store_harmonie(run, lead, f, grid, acc_prev):

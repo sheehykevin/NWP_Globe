@@ -21,7 +21,6 @@ or an off-screen plotter for screenshots.
 from __future__ import annotations
 
 import os
-import shutil
 import threading
 import warnings
 from datetime import datetime, timedelta, timezone
@@ -38,8 +37,8 @@ from globe_pressure import find_pressure_centres
 
 from globe_paths import APP_DIR as HERE  # next to the exe when built
 CACHE = os.path.join(HERE, "cache")
-# Prepared items of the pre-downloaded runs (globe_prefetch.py).
-PREFETCHED_CACHE = os.path.join(CACHE, "prefetched")
+# Prepared items of the store's runs, kept with them (globe_jobs.py).
+STORE_CACHE = os.path.join(CACHE, "store")
 CACHE_VERSION = 7                   # bump when prepared data changes
 
 RAIN = "precipitation_accumulation"
@@ -67,7 +66,7 @@ STYLES = {
                     units="mm", levels=[1, 2, 4, 8, 12, 16, 24, 32, 50],
                     colours=["#2B55FF", "#4BEB84", "#00C900", "#EFFE00",
                              "#FFFF8B", "#B44BC4", "#FF33FE", "#FF0000"],
-                    clear_below=1, opacity=0.88, visible=True),
+                    clear_below=1, opacity=0.88),
     "rain_run": dict(name="Run-total rainfall", kind="raster", hours="run",
                      units="mm", levels=[1, 5, 10, 20, 40, 60, 80, 120, 180],
                      colours=["#dce3e7", "#a3c9e5", "#4696cc", "#0096a1",
@@ -101,7 +100,7 @@ STYLES = {
                  levels=[0, 30, 60, 90, 110, 130, 160, 200], colours=_WIND,
                  opacity=0.76),
     "mslp": dict(name="MSLP contours", kind="isobars", colour="#1a1a1a",
-                 units="hPa", visible=True),
+                 units="hPa"),
     "barbs": dict(name="10 m wind barbs", kind="barbs", colour="#202020",
                   units="knots"),
     "waves": dict(name="Significant wave height", kind="raster",
@@ -110,12 +109,12 @@ STYLES = {
                   colours=["#dff3ff", "#b7e3fb", "#84cbf2", "#4fa9e3",
                            "#2b7fd0", "#2a9d6f", "#8cc63f", "#f5e33a",
                            "#f7a02c", "#e8452c", "#b51f5b", "#6b1a7a"],
-                  opacity=0.85, visible=True),
+                  opacity=0.85),
     "wave_dir": dict(name="Mean wave direction", kind="arrows",
                      param="sea_surface_wave_from_direction",
-                     colour="#202020", units="degrees", visible=True),
+                     colour="#202020", units="degrees"),
     "centres": dict(name="High / low centres", kind="centres",
-                    units="hPa", visible=True),
+                    units="hPa"),
 }
 RASTERS = [k for k, s in STYLES.items() if s["kind"] == "raster"]
 CENTRE_COLOURS = {"H": "#1f4fbf", "L": "#d01c1c"}
@@ -156,6 +155,25 @@ def needs(style):
     if s["kind"] == "barbs":
         return [WIND, WDIR]
     return [MSLP]
+
+
+def capable_styles(model):
+    """The layers a model can have, known without any download: from the
+    parameters its source publishes."""
+    import globe_data as gd
+    if model in WAVE_MODELS:
+        return list(WAVES)
+    if model in gd.FIELD_SOURCES:
+        have = set(gd.field_source(model).FIELDS)
+    elif model == "harmonie":
+        import globe_fetch
+        have = set(globe_fetch.HARMONIE_NEEDS)
+    else:                                   # Met Office: all of them
+        have = {p for s in STYLES for p in needs(s)}
+    hourly_rain = model not in ("ecmwf",)
+    return [s for s in STYLES if s not in WAVES
+            and all(p in have for p in needs(s))
+            and (s != "rain_1h" or hourly_rain)]
 
 
 def layer_id(model, style):
@@ -671,11 +689,8 @@ class Scene:
         self.lock = threading.Lock()
         self.wake = threading.Event()
         self.dirty = False
-        # Prepared items are saved in the session cache (deleted on
-        # close); a pre-downloaded cache (PREFETCHED_CACHE) is read too.
-        self.disk = disk or os.path.join(CACHE, "session")
-        if disk is None:
-            shutil.rmtree(self.disk, ignore_errors=True)
+        # Prepared items are saved with the store (kept).
+        self.disk = disk or STORE_CACHE
         os.makedirs(self.disk, exist_ok=True)
         self.keep_in_memory = keep_in_memory
         self.drawing = True
@@ -714,6 +729,15 @@ class Scene:
         viewer's defaults; the time axis grows to cover it."""
         m = lm.model
         with self.lock:
+            # A model loaded again (after a fetch): forget what was
+            # prepared from its earlier files.
+            if m in self.runs:
+                for key in [k for k in self.cache
+                            if split_id(k[0])[0] == m]:
+                    del self.cache[key]
+                for key in [k for k in self.rain if k[0] == m]:
+                    del self.rain[key]
+                self.centres_xyz.clear()
             self.runs[m], self.files[m] = lm.run, lm.files
             self.grids[m], self.styles[m] = lm.grid, lm.styles
             if m not in self.models:
@@ -917,14 +941,9 @@ class Scene:
         name = (f"{lid.replace(':', '_')}_{self.runs[model]}_"
                 f"{t:%Y%m%dT%H%MZ}.npz")
         saved = os.path.join(self.disk, name)
-        value = None
-        for folder in (self.disk, PREFETCHED_CACHE):
-            try:
-                value = _load_item(os.path.join(folder, name))
-                break
-            except (OSError, KeyError, ValueError):
-                continue
-        else:
+        try:
+            value = _load_item(saved)
+        except (OSError, KeyError, ValueError):
             value = self._compute(lid, t)
             if value is not None and not data.CLOSING.is_set():
                 try:

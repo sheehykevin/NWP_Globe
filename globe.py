@@ -108,10 +108,14 @@ def run_window(args):
     from geovista.qt import GeoQtInteractor
     from qtpy import QtCore, QtGui, QtWidgets
 
+    import globe_jobs as jobs
+
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     app.setStyle("Fusion")
     app.setStyleSheet(STYLE_SHEET)
-    data.clear_session()                     # left over from a crash
+    data.migrate()                           # older layouts -> the store
+    jobs.migrate_cache()
+    data.ALLOW_DOWNLOAD = False              # only fetch jobs download
 
     win = QtWidgets.QMainWindow()
     win.setWindowTitle("UKMO NWP Globe")
@@ -123,78 +127,173 @@ def run_window(args):
     for key in ("Up", "Down"):
         view.clear_events_for_key(key)
 
-    # ---- layer panel: one group per model, drag to reorder ----
-    collapsed = {m: False for m in data.MODELS}
+    collapsed = {m: True for m in data.MODELS}  # model lists folded
     panel_order = list(core.MODEL_ORDER)        # top first, loaded or not
-    fetching = {}                               # model -> note text
-    prefetched = set()                          # loaded from a pre-download
     done = queue.Queue()                        # (model, LoadedModel|error)
+    running = {}                                # model -> QProcess
+    waiting = {m: [] for m in data.MODELS}      # model -> [(layers, latest)]
+    progress = {}                               # model -> text
+    icon = download_icon(QtGui, QtCore)
+    small_icon = download_icon(QtGui, QtCore, 14)
 
+    # ---- fetch jobs (separate processes; the store keeps the results) ----
+    def job_command(model, layers, latest):
+        argv = ["--job", model, *layers] + (["--latest"] if latest else [])
+        if getattr(sys, "frozen", False):
+            return (os.path.join(os.path.dirname(sys.executable),
+                                 "nwp-globe-fetch.exe"), argv)
+        return sys.executable, [os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "globe.py"), *argv]
+
+    def fetch(model, layers=None, latest=False):
+        """Queue a job: ``layers`` of ``model`` (default: all)."""
+        layers = [s for s in (layers or core.capable_styles(model))
+                  if s in core.capable_styles(model)]
+        if not layers:
+            return
+        waiting[model].append((layers, latest))
+        progress[model] = "queued"
+        if model not in running:
+            start_next(model)
+        build_items()
+
+    def start_next(model):
+        if not waiting[model]:
+            return
+        layers, latest = waiting[model].pop(0)
+        proc = QtCore.QProcess(win)
+        proc.setProcessChannelMode(QtCore.QProcess.MergedChannels)
+        last = [""]
+        names = ", ".join(STYLES[s]["name"] for s in layers) \
+            if len(layers) <= 2 else f"{len(layers)} layers"
+        progress[model] = f"fetching {names} ..."
+
+        def output():
+            text = bytes(proc.readAll()).decode("utf-8", "replace")
+            for line in text.splitlines():
+                line = line.strip()
+                if line.startswith("PROGRESS "):
+                    _, _, d, w = line.split()
+                    progress[model] = f"fetching {names}: {d}/{w}"
+                elif line.startswith("DONE "):
+                    last[0] = "DONE"
+                elif line.startswith("FAILED "):
+                    last[0] = line.split(" ", 2)[2]
+                elif line:
+                    progress[model] = (f"fetching {names}: "
+                                       f"{line[:60]}")
+
+        def finished(code, _status):
+            running.pop(model, None)
+            if last[0] == "DONE":
+                progress[model] = "loading ..."
+                run = jobs.stored_run(model)
+
+                def work():
+                    try:
+                        done.put((model, core.load_model(model, run=run,
+                                                         area=args.area)))
+                    except Exception as exc:
+                        done.put((model, exc))
+                threading.Thread(target=work, daemon=True).start()
+            else:
+                progress[model] = ("fetch failed: " + (last[0] or
+                                   f"exit code {code}"))[:120]
+            if waiting[model]:
+                start_next(model)
+            build_items()
+        proc.readyRead.connect(output)
+        proc.finished.connect(finished)
+        running[model] = proc
+        prog, argv = job_command(model, layers, latest)
+        proc.start(prog, argv)
+
+    def stop_jobs():
+        for proc in list(running.values()):
+            proc.kill()
+            proc.waitForFinished(3000)
+    app.aboutToQuit.connect(stop_jobs)
+
+    # ---- layer panel: one group per model, drag to reorder ----
     def model_group(model):
         box = QtWidgets.QFrame()
         lay = QtWidgets.QVBoxLayout(box)
-        lay.setContentsMargins(4, 4, 4, 4)
-        lay.setSpacing(2)
+        lay.setContentsMargins(4, 3, 4, 3)
+        lay.setSpacing(1)
         head = QtWidgets.QHBoxLayout()
         grip = QtWidgets.QLabel("☰")
         grip.setToolTip("Drag to draw this model above or below the others")
         grip.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
         grip.setStyleSheet("color:#777;font-size:12pt")
         loaded = model in scene.models
-        title = data.MODELS[model]["label"] + (
-            f"  {scene.runs[model]}" if loaded else "") + (
-            "  (pre-downloaded)" if loaded and model in prefetched else "")
-        on = QtWidgets.QCheckBox(title)
-        on.setStyleSheet("font-weight:bold")
-        on.setChecked(scene.model_on.get(model, True))
-        on.setEnabled(loaded)
-        on.toggled.connect(lambda v, m=model: scene.set_model_on(m, v))
-        get = QtWidgets.QToolButton()
-        get.setIcon(download_icon(QtGui, QtCore))
-        get.setToolTip("Fetch the latest run" if not loaded
-                       else "Fetch the latest run again")
-        get.setEnabled(model not in fetching)
-        get.clicked.connect(lambda _=False, m=model: fetch(m))
         fold = QtWidgets.QToolButton()
         fold.setArrowType(QtCore.Qt.RightArrow if collapsed[model]
                           else QtCore.Qt.DownArrow)
         fold.setAutoRaise(True)
-        fold.setVisible(loaded)
+        fold.setToolTip("Show / hide this model's layers")
+        on = QtWidgets.QCheckBox()
+        on.setChecked(scene.model_on.get(model, True))
+        on.setEnabled(loaded)
+        on.setToolTip("Show / hide the whole model")
+        on.toggled.connect(lambda v, m=model: scene.set_model_on(m, v))
+        title = QtWidgets.QPushButton(
+            data.MODELS[model]["label"] + (f"  {scene.runs[model]}"
+                                           if loaded else "  (no data)"))
+        title.setFlat(True)
+        title.setStyleSheet("font-weight:bold;text-align:left;padding:0")
+        get = QtWidgets.QToolButton()
+        get.setIcon(icon)
+        get.setToolTip("Fetch and prepare everything of this model's "
+                       "latest run")
+        get.clicked.connect(lambda _=False, m=model: fetch(m, latest=True))
         head.addWidget(grip)
-        head.addWidget(on, 1)
-        head.addWidget(get)
         head.addWidget(fold)
+        head.addWidget(on)
+        head.addWidget(title, 1)
+        head.addWidget(get)
         lay.addLayout(head)
-        if not loaded:
-            note = QtWidgets.QLabel(fetching.get(
-                model, "Not loaded: press the download button."))
-            note.setStyleSheet("color:#555;font-size:8pt;margin-left:18px")
+        if model in progress:
+            note = QtWidgets.QLabel(progress[model])
+            note.setStyleSheet("color:#2b5fb4;font-size:8pt;margin-left:40px")
             note.setWordWrap(True)
             lay.addWidget(note)
-            return box
         body = QtWidgets.QWidget()
         rows = QtWidgets.QGridLayout(body)
-        rows.setContentsMargins(18, 0, 0, 0)
+        rows.setContentsMargins(40, 0, 0, 0)
         rows.setVerticalSpacing(1)
         r = 0
-        for name in reversed(scene.styles[model]):  # top layer first
+        for name in reversed(core.capable_styles(model)):  # top first
             lid = core.layer_id(model, name)
             style = STYLES[name]
+            has = lid in scene.visible
             tick = QtWidgets.QCheckBox(style["name"])
-            tick.setChecked(scene.visible[lid])
+            tick.setChecked(has and scene.visible[lid])
+            tick.setEnabled(has)
+            if not has:
+                tick.setToolTip("No data yet: press this layer's download "
+                                "button")
             values = QtWidgets.QCheckBox("123")
             values.setToolTip("Label the cells' own values (about 10 km "
                               "apart when zoomed in)")
-            values.setChecked(scene.label_on[lid])
+            values.setChecked(has and scene.label_on[lid])
             values.setVisible(style["kind"] == "raster")
+            values.setEnabled(has)
             slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
             slider.setRange(0, 100)
-            slider.setValue(int(round(scene.opacity[lid] * 100)))
+            slider.setValue(int(round(scene.opacity.get(
+                lid, style.get("opacity", 1.0)) * 100)))
             slider.setFocusPolicy(QtCore.Qt.NoFocus)
             slider.setToolTip("Opacity")
-            slider.setMaximumWidth(70)
+            slider.setMaximumWidth(60)
+            slider.setEnabled(has)
             pct = QtWidgets.QLabel(f"{slider.value()}%")
             pct.setMinimumWidth(30)
+            one = QtWidgets.QToolButton()
+            one.setIcon(small_icon)
+            one.setAutoRaise(True)
+            one.setToolTip(f"Fetch {style['name']} for every hour "
+                           "(downloads only what is not here yet)")
+            one.clicked.connect(lambda _=False, m=model, s=name: fetch(m, [s]))
             key = QtWidgets.QLabel()
             key.setPixmap(colour_key(style, QtGui, QtCore))
             key.setVisible(tick.isChecked())
@@ -214,7 +313,8 @@ def run_window(args):
             rows.addWidget(values, r, 1)
             rows.addWidget(slider, r, 2)
             rows.addWidget(pct, r, 3)
-            rows.addWidget(key, r + 1, 0, 1, 4)
+            rows.addWidget(one, r, 4)
+            rows.addWidget(key, r + 1, 0, 1, 5)
             r += 2
         body.setVisible(not collapsed[model])
         lay.addWidget(body)
@@ -226,6 +326,7 @@ def run_window(args):
                               else QtCore.Qt.DownArrow)
             resize_items()
         fold.clicked.connect(fold_clicked)
+        title.clicked.connect(fold_clicked)
         return box
 
     groups = QtWidgets.QListWidget()
@@ -243,6 +344,7 @@ def run_window(args):
                 item.setSizeHint(w.sizeHint())
 
     def build_items():
+        bar_pos = groups.verticalScrollBar().value()
         groups.blockSignals(True)
         groups.clear()
         for model in panel_order:
@@ -252,6 +354,7 @@ def run_window(args):
             groups.setItemWidget(item, model_group(model))
         groups.blockSignals(False)
         resize_items()
+        groups.verticalScrollBar().setValue(bar_pos)
 
     def reordered(*_):
         panel_order[:] = [groups.item(k).data(QtCore.Qt.UserRole)
@@ -262,90 +365,91 @@ def run_window(args):
         QtCore.QTimer.singleShot(0, build_items)
     groups.model().rowsMoved.connect(reordered)
 
-    # ---- fetching a model on request ----
-    procs = {}
+    # ---- fetch menus above the panel ----
+    def checklist(text, items, checked):
+        btn = QtWidgets.QToolButton()
+        btn.setText(text)
+        btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        menu = QtWidgets.QMenu(btn)
+        actions = {}
+        for key, label in items:
+            act = menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(checked)
+            actions[key] = act
+        menu.addSeparator()
+        menu.addAction("All", lambda: [a.setChecked(True)
+                                       for a in actions.values()])
+        menu.addAction("None", lambda: [a.setChecked(False)
+                                        for a in actions.values()])
+        btn.setMenu(menu)
+        return btn, actions
 
-    def fetch(model):
-        if model in fetching:
+    models_btn, model_acts = checklist(
+        "Models ▾", [(m, data.MODELS[m]["label"])
+                          for m in core.MODEL_ORDER], True)
+    params_btn, param_acts = checklist(
+        "Parameters ▾", [(s, STYLES[s]["name"]) for s in core.STYLES],
+        False)
+    go_fetch = QtWidgets.QPushButton("Fetch")
+    go_fetch.setToolTip("Fetch the ticked parameters for every ticked model "
+                        "that has them (latest run if none is stored)")
+
+    def fetch_menus():
+        layers = [s for s, a in param_acts.items() if a.isChecked()]
+        if not layers:
+            status_note.setText("  Tick parameters in the Parameters menu")
             return
-        if data.MODELS[model]["prefix"]:
-            # Met Office: find the latest run; files then come as layers
-            # need them.
-            fetching[model] = "Finding the latest run ..."
-            build_items()
+        for m, a in model_acts.items():
+            if a.isChecked():
+                fetch(m, [s for s in layers
+                          if s in core.capable_styles(m)])
+    go_fetch.clicked.connect(fetch_menus)
+    clear_btn = QtWidgets.QPushButton("Clear data")
+    clear_btn.setToolTip("Delete all downloaded data (the window restarts)")
 
-            def work():
-                try:
-                    done.put((model, core.load_model(model, area=args.area)))
-                except Exception as exc:
-                    done.put((model, exc))
-            threading.Thread(target=work, daemon=True).start()
+    def clear_store():
+        if running or any(waiting.values()):
+            status_note.setText("  Fetches are running: wait or close them "
+                                "first")
             return
-        # HARMONIE / IBI: fetched whole by globe_fetch.py.
-        fetching[model] = "Fetching ..."
-        build_items()
-        proc = QtCore.QProcess(win)
-        proc.setProcessChannelMode(QtCore.QProcess.MergedChannels)
-        last = [""]
-
-        def output():
-            text = bytes(proc.readAll()).decode("utf-8", "replace")
-            lines = [s.strip() for s in text.splitlines() if s.strip()]
-            if lines:
-                last[0] = lines[-1]
-                fetching[model] = last[0][:120]
-                status_note.setText(f"  {data.MODELS[model]['label']}: "
-                                    f"{last[0][:70]}")
-
-        def finished(code, _status):
-            if code == 0:
-                def work():
-                    try:
-                        done.put((model, core.load_model(
-                            model, area=args.area)))
-                    except Exception as exc:
-                        done.put((model, exc))
-                threading.Thread(target=work, daemon=True).start()
-            else:
-                done.put((model, RuntimeError(last[0] or "fetch failed")))
-        proc.readyRead.connect(output)
-        proc.finished.connect(finished)
-        procs[model] = proc
-        what = model                 # harmonie, ibi or nws
-        if getattr(sys, "frozen", False):   # built: the console program
-            proc.start(os.path.join(os.path.dirname(sys.executable),
-                                    "nwp-globe-fetch.exe"), ["--fetch", what])
-        else:
-            proc.start(sys.executable, [
-                os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             "globe_fetch.py"), what])
-
-    def stop_fetches():
-        for proc in procs.values():
-            if proc.state() != QtCore.QProcess.NotRunning:
-                proc.kill()
-                proc.waitForFinished(3000)
-    app.aboutToQuit.connect(stop_fetches)
+        if QtWidgets.QMessageBox.question(
+                win, "Clear downloaded data",
+                "Delete every downloaded model run and prepared layer?") \
+                != QtWidgets.QMessageBox.Yes:
+            return
+        import shutil
+        data.clear_session(wait=5.0)
+        shutil.rmtree(core.STORE_CACHE, ignore_errors=True)
+        QtCore.QProcess.startDetached(sys.executable, sys.argv)
+        app.quit()
+    clear_btn.clicked.connect(clear_store)
+    fetch_row = QtWidgets.QHBoxLayout()
+    for w in (models_btn, params_btn, go_fetch):
+        fetch_row.addWidget(w)
+    fetch_row.addStretch(1)
+    fetch_row.addWidget(clear_btn)
 
     panel = QtWidgets.QWidget()
     pl_lay = QtWidgets.QVBoxLayout(panel)
     pl_lay.setContentsMargins(2, 2, 2, 2)
-    hint = QtWidgets.QLabel("Press a model's download button to fetch its "
-                            "latest run.\nDrag a model by ☰ to draw it "
-                            "on top.")
+    pl_lay.addLayout(fetch_row)
+    hint = QtWidgets.QLabel(
+        "▸ opens a model's layers. Download buttons: the whole model "
+        "(header) or one layer\n(row). Downloads are kept until a newer "
+        "run is fetched. Drag ☰ to draw a model on top.")
     hint.setStyleSheet("color:#555;font-size:8pt")
     pl_lay.addWidget(hint)
     pl_lay.addWidget(groups, 1)
     note = QtWidgets.QLabel("Native model cells, no resampling. Rain "
-                            "windows end at the shown time.\nDownloads are "
-                            "deleted when the globe closes.")
+                            "windows end at the shown time.")
     note.setStyleSheet("color:#555;font-size:8pt")
     pl_lay.addWidget(note)
     dock = QtWidgets.QDockWidget("Layers", win)
     dock.setWidget(panel)
     dock.setFeatures(QtWidgets.QDockWidget.DockWidgetMovable
                      | QtWidgets.QDockWidget.DockWidgetFloatable)
-    dock.setMinimumWidth(370)
+    dock.setMinimumWidth(400)
     win.addDockWidget(QtCore.Qt.RightDockWidgetArea, dock)
     build_items()
 
@@ -356,8 +460,8 @@ def run_window(args):
     style = win.style()
     sp = QtWidgets.QStyle
 
-    def button(icon, tip, slot):
-        act = bar.addAction(style.standardIcon(icon), tip)
+    def button(icon_id, tip, slot):
+        act = bar.addAction(style.standardIcon(icon_id), tip)
         act.triggered.connect(slot)
         return act
 
@@ -439,23 +543,26 @@ def run_window(args):
     bar.addWidget(status_note)
 
     last_cam = [None, None]
+    shown_progress = [None]
 
     def poll():
-        # A model finished fetching?
+        # A model finished loading?
         while not done.empty():
             model, result = done.get()
-            fetching.pop(model, None)
             if isinstance(result, Exception):
-                fetching_msg = f"Fetch failed: {result}"
-                status_note.setText(f"  {data.MODELS[model]['label']}: "
-                                    f"{fetching_msg[:80]}")
+                progress[model] = f"could not load: {result}"[:120]
             else:
                 scene.add_model(result)
                 scene.set_order(panel_order)
-                status_note.setText(f"  {data.MODELS[model]['label']} "
-                                    f"{result.run} loaded")
+                if model not in running and not waiting[model]:
+                    progress.pop(model, None)
             build_items()
             sync_slider()
+        # Fetch progress changed: refresh the panel (not too often).
+        snap = tuple(sorted(progress.items()))
+        if snap != shown_progress[0]:
+            shown_progress[0] = snap
+            build_items()
         scene.refresh()
         # Relabel values after the camera has moved and settled.
         cam = tuple(round(v, 4) for v in scene.pl.camera.position)
@@ -465,17 +572,17 @@ def run_window(args):
             last_cam[1] = cam
             if any(scene.label_on.values()):
                 scene.update_labels()
-        ready, wanted, downloading = scene.status()
-        text = (f"  {ready}/{wanted} ready" if ready < wanted
-                else "  all ready") if wanted else ""
-        if downloading:
-            text += f", downloading {downloading}"
+        ready, wanted, _ = scene.status()
+        text = (f"  {ready}/{wanted} shown layers ready" if ready < wanted
+                else "  all shown layers ready") if wanted else ""
+        if running:
+            text += f", fetching {len(running)} model(s)"
         if scene.label_note and any(scene.label_on.values()):
             text += f", {scene.label_note}"
         status.setText(text)
     poller = QtCore.QTimer(win)
     poller.timeout.connect(poll)
-    poller.start(300)
+    poller.start(500)
 
     shortcuts = (("Right", lambda: go(scene.i + 1)),
                  ("Left", lambda: go(scene.i - 1)),
@@ -496,11 +603,11 @@ def run_window(args):
     sync_slider()
     scene.start_workers()
     win.show()
-    import globe_prefetch
-    for model, run in globe_prefetch.manifest().items():
-        if model in data.MODELS:
-            prefetched.add(model)
-            fetching[model] = "Loading the pre-downloaded run ..."
+    # Models already in the store open at once.
+    for model in core.MODEL_ORDER:
+        run = jobs.stored_run(model)
+        if run:
+            progress[model] = "loading ..."
 
             def work(model=model, run=run):
                 try:
@@ -509,10 +616,9 @@ def run_window(args):
                 except Exception as exc:
                     done.put((model, exc))
             threading.Thread(target=work, daemon=True).start()
-    if prefetched:
-        build_items()
+    build_items()
     for model in args.load:                     # optional, at start
-        fetch(model)
+        fetch(model, latest=True)
     if args.smoke:
         # Testing: save a picture of the whole window, then close.
         def grab():
@@ -522,16 +628,12 @@ def run_window(args):
             app.quit()
         QtCore.QTimer.singleShot(args.smoke_wait * 1000, grab)
     code = app.exec_()
-    # Downloads are for this session only.
-    data.clear_session(wait=10.0)
-    import shutil
-    shutil.rmtree(scene.disk, ignore_errors=True)
+    data.CLOSING.set()                       # stop the window's workers
     return code
 
 
 def run_screenshot(args):
     import geovista as gv
-    data.clear_session()
     pl = gv.GeoPlotter(off_screen=True, window_size=(1400, 1000))
     scene = core.Scene(pl, area=args.area, base=args.base, view=args.view)
     for model in args.load:
@@ -552,16 +654,13 @@ def run_screenshot(args):
     scene.show(render=False, block=True)
     pl.show(screenshot=args.screenshot)
     print("wrote", args.screenshot, "valid", scene.time)
-    if not args.keep:
-        data.clear_session()
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--load", nargs="*", default=[],
                     choices=list(data.MODELS), metavar="MODEL",
-                    help="models to fetch at start (default: none; use the "
-                    "download buttons)")
+                    help="models to fetch (latest run, all layers) at start")
     ap.add_argument("--base", choices=["grey", "colour"], default="grey")
     ap.add_argument("--area", choices=sorted(core.AREAS), default="atlantic",
                     help="Global area drawn (default: %(default)s)")
@@ -585,29 +684,31 @@ def main():
                     "first (the rest follow)")
     ap.add_argument("--steps", type=int, default=0,
                     help="with --screenshot: time steps to move first")
-    ap.add_argument("--keep", action="store_true",
-                    help="with --screenshot: keep the downloads")
     ap.add_argument("--smoke", help="testing: open the window, save a "
                     "picture of it and close")
     ap.add_argument("--smoke-wait", type=int, default=8,
                     help="seconds before --smoke saves (default 8)")
+    ap.add_argument("--job", nargs="+", metavar=("MODEL", "LAYER"),
+                    help="fetch and prepare layers of one model (default: "
+                    "all) into the store; used by the window")
+    ap.add_argument("--latest", action="store_true",
+                    help="with --job: the latest published run")
     ap.add_argument("--prefetch", nargs="*", metavar="MODEL",
-                    help="pre-download and prepare the latest run of these "
-                    "models (default: all), kept until the next "
-                    "pre-download; see globe_prefetch.py")
-    ap.add_argument("--prefetch-swap", action="store_true",
-                    help="swap in a complete pre-download whose last step "
-                    "was refused (a folder was open)")
+                    help="latest run of these models (default: all), every "
+                    "layer or those given with --layers, into the store")
+    ap.add_argument("--layers", nargs="*", default=None, metavar="LAYER",
+                    help="with --prefetch: only these layers, e.g. rain_6h "
+                    "mslp")
     ap.add_argument("--fetch", nargs=argparse.REMAINDER,
-                    help="fetch HARMONIE/IBI/NWS like globe_fetch.py (used "
-                    "by the built program's download buttons)")
+                    help="run globe_fetch.py (HARMONIE / waves) directly")
     args = ap.parse_args()
-    if args.prefetch_swap:
-        import globe_prefetch
-        return globe_prefetch.finish_swap()
+    if args.job:
+        import globe_jobs
+        return globe_jobs.run_job(args.job[0], args.job[1:] or None,
+                                  latest=args.latest)
     if args.prefetch is not None:
-        import globe_prefetch
-        return globe_prefetch.run(args.prefetch)
+        import globe_jobs
+        return globe_jobs.prefetch(args.prefetch or None, args.layers)
     if args.fetch is not None:
         import globe_fetch
         return globe_fetch.main(args.fetch)

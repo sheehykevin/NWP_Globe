@@ -39,7 +39,7 @@ if os.path.isfile(_cacert):
 # in eccodes/lib, where findlibs looks when ECCODES_DIR is set.
 binaries = [(p, os.path.join("eccodes", "lib"))
             for p in glob.glob(os.path.join(lib, "bin", "eccodes*.dll"))]
-hiddenimports = ["globe_core", "globe_data", "globe_fetch", "globe_icon",
+hiddenimports = ["globe_core", "globe_jobs", "globe_data", "globe_fetch", "globe_icon",
                  "globe_ecmwf", "globe_gfs", "globe_meteofrance",
                  "globe_pressure", "globe_paths", "xarray.backends.netCDF4_",
                  "scipy.ndimage", "contourpy", "geovista.qt", "pyvistaqt"]

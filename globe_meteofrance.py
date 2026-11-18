@@ -10,8 +10,10 @@ https://meteofrance-pnt.s3.rbx.io.cloud.ovh.net/pnt/<run>/<model>/<res>/<pkg>/
 AROME runs every 3 hours, AROME-IFS every 6 hours; both to T+51.
 Grid: regular lat/lon, 12W-16E, 37.5-55.4N.
 
-There is no byte index, so whole package files are fetched, only those a
-switched-on layer needs. Values are the file's own; rain over a period is
+There is no byte index, so the globe makes one: it reads the first
+kilobyte of each GRIB2 message in a package (HTTP range requests) for
+its code, level and time range, then fetches only the messages wanted
+(not whole packages). Values are the file's own; rain over a period is
 the step in the run accumulation, wind speed and direction come from
 10 m u/v, the gust is the maximum over the past hour. CAPE is
 ``CAPE_INS``, Météo-France's instantaneous CAPE (the parcel used is not
@@ -31,7 +33,6 @@ from __future__ import annotations
 import threading
 import urllib.error
 import urllib.request
-from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 
 BASE = "https://meteofrance-pnt.s3.rbx.io.cloud.ovh.net/pnt"
@@ -59,8 +60,8 @@ SOURCES_001 = {
 SOURCES = SOURCES_0025
 WIND_PARAMS = {"wind_speed_at_10m", "wind_direction_at_10m"}
 
-# Raw packages kept in memory (few: they are tens of MB each).
-_PACKAGES = OrderedDict()
+# Package indexes (message positions), made once per file.
+_INDEXES = {}
 _LOCKS = {}
 _LOCK = threading.Lock()
 
@@ -116,49 +117,70 @@ class Product:
             t -= timedelta(hours=1)
         return None
 
-    def _package(self, url):
-        """Raw package bytes and its messages {(shortName, stepRange):
-        (offset, length)}; downloaded once, a few kept in memory."""
+    def _index(self, url):
+        """Messages of one package file: {(code, level type, start, end):
+        (offset, length)}, from range requests on their headers; None if
+        the file is not published. Kept for the session."""
         with _LOCK:
-            if url in _PACKAGES:
-                _PACKAGES.move_to_end(url)
-                return _PACKAGES[url]
+            if url in _INDEXES:
+                return _INDEXES[url]
             lock = _LOCKS.setdefault(url, threading.Lock())
-        with lock:                      # one download per package
+        with lock:                      # one index per package
             with _LOCK:
-                if url in _PACKAGES:
-                    return _PACKAGES[url]
-            try:
-                with urllib.request.urlopen(url, timeout=600) as r:
-                    raw = r.read()
-            except urllib.error.HTTPError as exc:
-                if exc.code == 404:
-                    return None
-                raise
-            pkg = (raw, _scan(raw))
+                if url in _INDEXES:
+                    return _INDEXES[url]
+            import requests
+            from globe_fetch import _range
+            s = requests.Session()
+            first = s.get(url, headers={"Range": "bytes=0-0"}, timeout=60)
+            if first.status_code == 404:
+                return None
+            first.raise_for_status()
+            total = int(first.headers["Content-Range"].rsplit("/", 1)[1])
+            out, pos = {}, 0
+            while pos + 16 <= total:
+                head = _range(s, url, pos, min(pos + 1023, total - 1))
+                if head[:4] != b"GRIB":
+                    break
+                length = int.from_bytes(head[8:16], "big")
+                key = _grib2_key(head)
+                if key:
+                    out[key] = (pos, length)
+                pos += length
             with _LOCK:
-                _PACKAGES[url] = pkg
-                while len(_PACKAGES) > 3:
-                    _PACKAGES.popitem(last=False)
-            return pkg
+                _INDEXES[url] = out
+            return out
 
     def _get(self, run, source, step, cache):
         """One source's field(s) at ``step``: a list of decoded fields,
-        one per GRIB name, or None if any is missing."""
+        one per GRIB name, or None if any is missing. Only those messages
+        are downloaded."""
         package, shorts, kind = source
-        rng = {"instant": str(step), "hourmax": f"{step - 1}-{step}",
-               "fromstart": f"0-{step}"}[kind]
+        when = {"instant": (step, step), "hourmax": (step - 1, step),
+                "fromstart": (0, step)}[kind]
         out = []
+        url = self.url(run, package, step)
         for short in shorts:
-            key = (short, rng)
-            if key not in cache:
-                pkg = self._package(self.url(run, package, step))
-                if pkg is None or key not in pkg[1]:
+            disc, cat, num, level = CODES[short]
+            ckey = (short, when)
+            if ckey not in cache:
+                index = self._index(url)
+                if index is None:
                     return None
+                hit = [v for k, v in index.items()
+                       if k[:3] == (disc, cat, num)
+                       and (level is None or k[3] == level)
+                       and k[4:] == when]
+                if not hit:
+                    return None
+                import requests
                 import globe_gfs
-                off, n = pkg[1][key]
-                cache[key] = globe_gfs._decode(pkg[0][off:off + n])
-            out.append(cache[key])
+                from globe_fetch import DECODE_LOCK, _range
+                off, n = hit[0]
+                raw = _range(requests.Session(), url, off, off + n - 1)
+                with DECODE_LOCK:
+                    cache[ckey] = globe_gfs._decode(raw)
+            out.append(cache[ckey])
         return out
 
     def make_field(self, run, parameter, valid, period, cache):
@@ -203,22 +225,43 @@ class Product:
         return got[0]
 
 
-def _scan(raw):
-    """Where each GRIB message is: {(shortName, stepRange): (off, len)}."""
-    import eccodes as ec
-    out, i = {}, 0
-    while True:
-        i = raw.find(b"GRIB", i)
-        if i < 0:
-            return out
-        n = int.from_bytes(raw[i + 8:i + 16], "big")       # GRIB2 length
-        gid = ec.codes_new_from_message(raw[i:i + n])
-        try:
-            out[(ec.codes_get(gid, "shortName"),
-                 str(ec.codes_get(gid, "stepRange")))] = (i, n)
-        finally:
-            ec.codes_release(gid)
-        i += n
+# GRIB2 code (discipline, category, number) and first-surface type of
+# each field used (from the packages' inventory, docs/models/arome_*.md;
+# None: any level type).
+CODES = {
+    "prmsl": (0, 3, 1, None), "2t": (0, 0, 0, 103), "10u": (0, 2, 2, 103),
+    "10v": (0, 2, 3, 103), "10fg": (0, 2, 22, 103), "10efg": (0, 2, 23, 103),
+    "10nfg": (0, 2, 24, 103), "tp": (0, 1, 52, None),
+    "CAPE_INS": (0, 7, 6, None), "tirf": (0, 1, 65, None),
+    "tsnowp": (0, 1, 66, None), "tgrp": (0, 1, 75, None),
+}
+
+
+def _grib2_key(head):
+    """(discipline, category, number, first surface type, start hour,
+    end hour) of a GRIB2 message from its first bytes (section 4,
+    templates 4.0 and 4.8; hours as the forecast time unit)."""
+    disc = head[6]
+    p = 16
+    while p + 5 <= len(head):
+        size = int.from_bytes(head[p:p + 4], "big")
+        num = head[p + 4]
+        if num == 4:
+            s = head[p:p + size]
+            if len(s) < 28:
+                return None
+            template = int.from_bytes(s[7:9], "big")
+            cat, number = s[9], s[10]
+            ft = int.from_bytes(s[18:22], "big")
+            surface = s[22]
+            start = end = ft
+            if template == 8 and len(s) >= 53:
+                end = ft + int.from_bytes(s[49:53], "big")
+            return disc, cat, number, surface, start, end
+        if size <= 0:
+            return None
+        p += size
+    return None
 
 
 AROME_0025 = Product("arome", "0025", 3)

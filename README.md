@@ -30,20 +30,38 @@ conda env create -f environment.yml
 conda run -n ukmo_globe python globe.py
 ```
 
-## Pre-downloading everything
+## Fetching and the store
 
-`prefetch.bat` (or `globe.py --prefetch`) fetches the latest run of
-every model (or only those named, e.g. `prefetch.bat ukv global ecmwf`)
-and prepares every layer for every hour, so the globe opens with those
-models already loaded and shows any layer or hour without downloading.
-It is kept in `data\prefetched` and `cache\prefetched` until the next
-pre-download replaces it (a failed pre-download keeps the previous one);
-it is not deleted when the globe closes. A download button still
-fetches a newer run for that session.
+Nothing is downloaded until asked for, and everything fetched is kept.
 
-All models take of the order of an hour and several GB (HARMONIE alone
-streams 3.4 GB); the summary at the end lists each model's run and time
-and the total size.
+- **In the window**: each model's download button (header) fetches and
+  prepares every layer of its latest run; each layer's own button
+  fetches that layer for every hour. The **Models** and **Parameters**
+  menus at the top of the panel with **Fetch** fetch the ticked
+  parameters for every ticked model that has them. Fetches run as
+  separate processes; progress shows under the model's name and the
+  model reloads when done.
+- **From the command line**: `prefetch.bat` (or `globe.py --prefetch`)
+  fetches the latest run of every model, or only those named
+  (`prefetch.bat ukv ecmwf`), all layers or only those given
+  (`prefetch.bat ecmwf --layers rain_6h mslp`). `globe.py --job MODEL
+  [LAYER ...] [--latest]` runs one fetch job.
+
+A layer's fetch downloads only the fields it needs and skips what is
+already there: isobars after MSLP has been fetched for the rain-free
+layers download nothing, only prepare. Derived layers (isobars, centres,
+barbs, rain windows) are prepared only when their own fetch (or the
+model's) is asked for.
+
+Everything is kept in `data\store` (prepared layers in `cache\store`)
+until a newer run of that model is fetched, which replaces it; models
+in the store open at start. **Clear data** deletes the store.
+
+HARMONIE and the Météo-France packages have no byte index, so the globe
+makes one: it reads the first bytes of each GRIB message with HTTP range
+requests and fetches only the messages wanted (HARMONIE MSLP for a whole
+run is about 50 MB of the 3.4 GB archive; checked identical to a
+whole-archive decode).
 
 ## Standalone build
 
@@ -63,30 +81,29 @@ needed there. The build:
 6. smoke-tests the two programs.
 
 The folder holds `NWP_Globe.exe` (the window) and `nwp-globe-fetch.exe`
-(a console program the window runs for HARMONIE and wave downloads, so
-it can report progress). Downloads, prepared layers and `.env` live
-next to the exe (`data`, `cache`); downloads are deleted on close as
-before. Close `NWP_Globe.exe` and anything open from `dist\NWP_Globe`
+(a console program that runs the fetch jobs and `prefetch.bat`). Downloads, prepared layers and `.env` live
+next to the exe (`data`, `cache`) and are kept (see Fetching and the
+store). Close `NWP_Globe.exe` and anything open from `dist\NWP_Globe`
 before rebuilding. Wave models still need a Copernicus login on the
 target computer (see docs/CREDENTIALS.md).
 
 ## Layers
 
 Each weather model has these layers (those it has data for), with the
-viewer's bands, colours, default opacity and default on/off.
+viewer's bands, colours and default opacity. Every layer starts off.
 
-| Layer | From | On at start |
+| Layer | From | |
 |---|---|---|
-| High / low centres | MSLP; closed highs (blue H) and lows (red L), the viewer's method | yes |
+| High / low centres | MSLP; closed highs (blue H) and lows (red L), the viewer's method | |
 | 10 m wind barbs | 10 m speed and direction, knots | |
-| MSLP contours | black isobars every 4 hPa, labelled | yes |
+| MSLP contours | black isobars every 4 hPa, labelled | |
 | 10 m wind gust | km/h, gust warning bands | |
 | 10 m wind speed | km/h | |
 | Screen temperature | °C | |
 | Most-unstable CAPE | J/kg | |
 | 24-hour rainfall | sum of the model's files ending at the shown time | |
 | Run-total rainfall | sum from the start of the run | |
-| 6-hour rainfall | sum | yes |
+| 6-hour rainfall | sum | |
 | 3-hour rainfall | sum | |
 | 1-hour rainfall | hourly file | |
 
@@ -106,19 +123,15 @@ What each source publishes (every field, from its live listings) is in
 [docs/models/SUMMARY.md](docs/models/SUMMARY.md). Regenerate with
 `conda run -n ukmo_globe python tools/model_inventory.py`.
 
-The globe opens empty. Each model's group in the layer panel has a
-download button (a box with a down arrow) that fetches that model's
-latest run; nothing is downloaded until you press it. Everything
-downloaded is kept in `data\session` (prepared layers in
-`cache\session`) and deleted when the globe closes, or at the next start
-if it did not close cleanly.
+Every model is listed in the panel with all the layers it can have,
+data or not; see Fetching and the store.
 
 | Model | Grid | Latest run and download |
 |---|---|---|
 | UKV | 2 km Lambert equal area | Newest run (every 3 h) whose T+54 is published on the Met Office AWS bucket; files come as layers need them |
-| HARMONIE (KNMI) | P3 (deterministic): rotated pole, 0.05 deg (about 5.5 km), Europe | Newest P3 run on the KNMI Open Data API; about 3.4 GB streamed, only the fields drawn are kept (a few minutes to load) |
-| AROME 1.3 km (Météo-France) | 0.01 deg lat/lon, 12W-16E, 37.5-55.4N | Météo-France open data (data.gouv.fr "Paquets AROME"), newest run (every 3 h, to T+51) whose last file is published; one file per hour per package, fetched as layers need them (SP1 about 23 MB, SP2 about 21 MB) |
-| AROME 2.5 km (Météo-France) | 0.025 deg lat/lon, same domain | As above at 0.025 deg; 6-hour packages (SP1 about 58 MB, SP2 about 49 MB) |
+| HARMONIE (KNMI) | P3 (deterministic): rotated pole, 0.05 deg (about 5.5 km), Europe | Newest P3 run on the KNMI Open Data API; only the GRIB messages wanted are fetched from the 3.4 GB archive (byte ranges) |
+| AROME 1.3 km (Météo-France) | 0.01 deg lat/lon, 12W-16E, 37.5-55.4N | Météo-France open data (data.gouv.fr "Paquets AROME"), newest run (every 3 h, to T+51) whose last file is published; one file per hour per package; only the messages wanted are fetched (byte ranges) |
+| AROME 2.5 km (Météo-France) | 0.025 deg lat/lon, same domain | As above at 0.025 deg |
 | AROME-IFS 2.5 km (Météo-France) | 0.025 deg lat/lon, same domain | AROME-IFS packages, newest run (every 6 h, to T+51) |
 | ICON-EU (DWD) | 0.0625 deg lat/lon (about 7 km), 23.5W-62.5E, 29.5-70.5N | Newest 00, 06, 12 or 18Z run (to T+120: hourly to T+78, then 3-hourly) whose T+120 is on opendata.dwd.de; the 03/09/15/21Z runs (to T+30 only) are not used; files (bz2 GRIB2, about 1 MB each) come as layers need them |
 | ECMWF IFS 0.1 | 0.1 deg lat/lon, North Atlantic and Europe block | ECMWF open data (data.ecmwf.int, `0p1/oper`), newest run whose last step is published: 00 and 12Z to T+120, 06 and 18Z to T+90, every 3 hours; only the fields a layer needs are fetched (HTTP range requests on each step's index) |
@@ -140,8 +153,8 @@ T+90 (`10fg`), then over the 3 hours before it (`10fg3`); its CAPE is
 most-unstable CAPE (`mucape`). Data: ECMWF open data, CC BY 4.0.
 
 The three Météo-France models need no account. Their files have no
-byte index, so whole packages are fetched (only those a switched-on
-layer needs; SP2 only for CAPE). CAPE is Météo-France's `CAPE_INS`
+byte index; only the messages wanted are fetched (see Fetching and
+the store). CAPE is Météo-France's `CAPE_INS`
 (instantaneous CAPE; the files do not say which parcel). Rain over a
 period is the step in the run accumulation: `tp` at 0.025 deg; at
 0.01 deg rain + snow + graupel (`tirf`, `tsnowp`, `tgrp`) summed. The
@@ -171,10 +184,13 @@ field in the run.
 ## The window
 
 **Layers panel** (right): one group per model. Its header has a drag
-handle (☰: drag above another model to draw it on top), an on/off tick
-for the whole model, the run, the download button and an arrow to fold
-it. Each layer has a tick, a **123** tick box for value labels (coloured
-layers), an opacity slider and (when on) its colour key.
+handle (☰: drag above another model to draw it on top), an arrow (or
+click the name) to open or fold its layers (folded at start), an on/off
+tick for the whole model, the run (or "no data") and the model's
+download button. Each layer has a tick (greyed until it has data), a
+**123** tick box for value labels (coloured layers), an opacity slider,
+its own download button and (when on) its colour key. Above the groups:
+the Models and Parameters fetch menus, Fetch, and Clear data.
 
 **Value labels**: the cells' own values (no interpolation), about 10 km
 apart, for the part of the globe in view. Zoomed out, the spacing widens
@@ -205,29 +221,29 @@ Shift+drag to pan.
 
 | Option | Meaning |
 |---|---|
-| `--load MODEL ...` | Fetch these models at start (default: none) |
+| `--load MODEL ...` | Fetch these models (latest run, all layers) at start |
 | `--base grey` / `colour` | Background: Natural Earth I shaded relief in grey (default) or in colour |
 | `--area atlantic` / `world` | Global area drawn (default `atlantic`: 80°W-50°E, 15-80°N) |
 | `--view ireland` / `atlantic` | Starting view |
 
 For testing: `--screenshot FILE --load MODEL ...` draws off screen and
 writes a PNG (with `--valid TIME`, `--show` / `--hide` / `--labels
-MODEL:LAYER ...`, `--order`, `--steps N`, `--keep`); `--smoke FILE`
+MODEL:LAYER ...`, `--order`, `--steps N`); `--smoke FILE`
 opens the window, saves a picture of it and closes. `globe_fetch.py
 harmonie|ibi` fetches from the command line.
 
 ## Speed
 
-Layers are prepared only while switched on, by three background
-workers, nearest times first; stepping through prepared times is
-near-instant.
+Layers fetched are prepared for every hour and saved, so stepping
+through them is near-instant.
 
 ## Files
 
 | File | What it holds |
 |---|---|
 | `globe_core.py` | Layers, rain sums, drawing and background preparation; no window code |
-| `globe_data.py` | Session folder, latest runs, downloading Met Office files |
+| `globe_jobs.py` | Fetch jobs (window buttons, `prefetch.bat`) and the store |
+| `globe_data.py` | The store folder, latest runs, downloading Met Office files |
 | `globe_pressure.py` | High/low centres, copied from the UKMO NWP tools |
 | `globe_icon.py` | ICON-EU (DWD): latest run, fetching and converting files |
 | `globe_ecmwf.py` | ECMWF IFS 0.1 deg open data: latest run, fetching fields |
