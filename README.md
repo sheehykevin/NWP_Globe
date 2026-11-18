@@ -156,6 +156,13 @@ data or not; see Fetching and the store.
 | NWS waves (1.5 km) | about 1.5 km lat/lon, 16W-13E, 46-62.7N | Copernicus Marine `NWSHELF_ANALYSISFORECAST_WAV_004_014` (`cmems_mod_nws_wav_anfc_1.5km_PT1H-i`), today 00Z to +72 h; significant wave height and mean wave direction, as IBI |
 | IBI waves | about 3 km lat/lon, 19W-5E, 26-56N | Copernicus Marine `IBI_ANALYSISFORECAST_WAV_005_005`, today 00Z to +72 h; significant wave height and mean wave direction (arrows point where the waves go) |
 
+**Area of the global models**: UKMO Global, ECMWF and both GFS products
+are cut to one North Atlantic and Europe box, **80°W–50°E, 15°N–80°N**
+(`globe_core.AREAS["atlantic"]`, `globe_ecmwf.AREA`, `globe_gfs.AREA`).
+Their fields are still downloaded whole (global) and cut after reading;
+`--area world` draws UKMO Global in full but does not change ECMWF or
+GFS. The regional models are drawn on their own domains, uncut.
+
 ICON-EU has the same layers as UKV, with two notes: its CAPE is
 mixed-layer CAPE (ICON-EU publishes no most-unstable CAPE), and its
 rain over a period is the step in its run accumulation (`TOT_PREC`).
