@@ -358,6 +358,7 @@ def run_window(args):
     # ---- layer panel: one group per model, drag to reorder ----
     ui = {}                          # model -> its group's live widgets
     sizes = {}                       # model -> bytes in the store
+    wanted_on = set()                # layers ticked before they had data
 
     def human(n):
         return f"{n / 1e9:.1f} GB" if n >= 1e8 else f"{n / 1e6:.0f} MB"
@@ -470,8 +471,7 @@ def run_window(args):
             style = STYLES[name]
             has = lid in scene.visible
             tick = QtWidgets.QCheckBox(style["name"])
-            tick.setChecked(has and scene.visible[lid])
-            tick.setEnabled(has)
+            tick.setChecked((has and scene.visible[lid]) or lid in wanted_on)
             state = QtWidgets.QLabel()
             ui[model]["rows"][name] = (tick, state)
             values = QtWidgets.QCheckBox("123")
@@ -500,10 +500,17 @@ def run_window(args):
             key.setPixmap(colour_key(style, QtGui, QtCore))
             key.setVisible(tick.isChecked())
 
-            def toggled(v, lid=lid, key=key):
+            def toggled(v, lid=lid, key=key, m=model, s=name):
                 key.setVisible(v)
                 resize_items()
-                scene.set_visible(lid, v)
+                if v and not layer_state(m)[0].get(s) and                         m not in running and not waiting[m]:
+                    fetch(m, [s])        # nothing fetched yet: fetch it
+                if lid in scene.layers:
+                    scene.set_visible(lid, v)
+                elif v:                  # shown once the model reloads
+                    wanted_on.add(lid)
+                else:
+                    wanted_on.discard(lid)
 
             def moved(v, lid=lid, label=pct):
                 label.setText(f"{v}%")
@@ -603,7 +610,8 @@ def run_window(args):
                         "button for the rest", "", None)
             else:
                 look = ("", "", "", "color:#8a8a8a",
-                        "Not fetched: press this layer's download button")
+                        "Not fetched: tick it (or press its download button) to "
+                "fetch it")
             if state.text() != look[0]:
                 state.setText(look[0])
                 state.setStyleSheet(look[1])
@@ -996,6 +1004,9 @@ def run_window(args):
             else:
                 scene.add_model(result)
                 apply_saved(model)
+                for lid in [x for x in wanted_on if x in scene.layers]:
+                    scene.visible[lid] = True
+                    wanted_on.discard(lid)
                 scene.set_order(panel_order)
                 if model not in running and not waiting[model]:
                     progress.pop(model, None)
