@@ -38,6 +38,12 @@ MODELS = {
     "icon": dict(label="ICON-EU (DWD)", dir="icon", prefix="dwd"),
     # ECMWF open data 0.1 deg, field by field (globe_ecmwf.py).
     "ecmwf": dict(label="ECMWF IFS 0.1", dir="ecmwf", prefix="ecmwf"),
+    # NOAA GFS on AWS, field by field (globe_gfs.py): its two products
+    # are two models, each on its own grid.
+    "gfs_sflux": dict(label="GFS sflux 13 km (NOAA)", dir="gfs_sflux",
+                      prefix="noaa"),
+    "gfs_0p25": dict(label="GFS 0.25 (NOAA)", dir="gfs_0p25",
+                     prefix="noaa"),
     "global": dict(label="Global", dir="global10km",
                    prefix="global-deterministic-10km",
                    run_hours=range(0, 24, 6), last_lead=54),
@@ -55,12 +61,15 @@ def stamp(text):
 
 
 # Models fetched field by field through a module of their own.
-FIELD_SOURCES = {"icon": "globe_icon", "ecmwf": "globe_ecmwf"}
+FIELD_SOURCES = {"icon": "globe_icon", "ecmwf": "globe_ecmwf",
+                 "gfs_sflux": "globe_gfs:SFLUX", "gfs_0p25": "globe_gfs:P025"}
 
 
 def field_source(model):
     import importlib
-    return importlib.import_module(FIELD_SOURCES[model])
+    module, _, name = FIELD_SOURCES[model].partition(":")
+    mod = importlib.import_module(module)
+    return getattr(mod, name) if name else mod
 
 
 def published_leads(model, parameter, run=None):

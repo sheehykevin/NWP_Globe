@@ -137,7 +137,8 @@ CLEAR = 255                         # class code: see-through
 PENDING = object()                  # cache marker: not prepared yet
 
 
-MODEL_ORDER = ["ukv", "harmonie", "icon", "ecmwf", "global", "ibi"]
+MODEL_ORDER = ["ukv", "harmonie", "icon", "ecmwf", "gfs_sflux",
+               "gfs_0p25", "global", "ibi"]
 WAVES = ("waves", "wave_dir")               # the IBI model's only layers
 
 
@@ -567,8 +568,8 @@ class LoadedModel:
 
 
 def _make_grid(model, files, run, area):
-    params = {"ibi": [STYLES["waves"]["param"]]}.get(model,
-                                                     [MSLP, RAIN, WIND])
+    params = {"ibi": [STYLES["waves"]["param"]],
+              "gfs_sflux": [WIND, RAIN]}.get(model, [MSLP, RAIN, WIND])
     path = None
     for param in params:
         held = files.held(param)
@@ -576,7 +577,8 @@ def _make_grid(model, files, run, area):
             path = next(iter(held.values()))
             break
     if path is None and files.can_download:
-        path = files.path(MSLP, data.stamp(run))       # one small file
+        first = WIND if model == "gfs_sflux" else MSLP
+        path = files.path(first, data.stamp(run))      # one small file
     if path is None:
         raise RuntimeError(f"No {data.MODELS[model]['label']} files for "
                            f"{run}")
@@ -586,7 +588,7 @@ def _make_grid(model, files, run, area):
         return RotatedGrid(path)
     if model == "global":
         return GlobalGrid(path, AREAS[area])
-    if model in ("icon", "ecmwf"):
+    if model in ("icon", "ecmwf", "gfs_sflux", "gfs_0p25"):
         return GlobalGrid(path, None, wrap=False)
     return GlobalGrid(path, None, wrap=False, km=ARROW_KM)
 

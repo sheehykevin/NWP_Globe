@@ -70,6 +70,8 @@ if it did not close cleanly.
 | HARMONIE (KNMI) | P3 (deterministic): rotated pole, 0.05 deg (about 5.5 km), Europe | Newest P3 run on the KNMI Open Data API; about 3.4 GB streamed, only the fields drawn are kept (a few minutes to load) |
 | ICON-EU (DWD) | 0.0625 deg lat/lon (about 7 km), 23.5W-62.5E, 29.5-70.5N | Newest 00, 06, 12 or 18Z run (to T+120: hourly to T+78, then 3-hourly) whose T+120 is on opendata.dwd.de; the 03/09/15/21Z runs (to T+30 only) are not used; files (bz2 GRIB2, about 1 MB each) come as layers need them |
 | ECMWF IFS 0.1 | 0.1 deg lat/lon, North Atlantic and Europe block | ECMWF open data (data.ecmwf.int, `0p1/oper`), newest run whose last step is published: 00 and 12Z to T+120, 06 and 18Z to T+90, every 3 hours; only the fields a layer needs are fetched (HTTP range requests on each step's index) |
+| GFS sflux 13 km (NOAA) | T1534 Gaussian (about 13 km), North Atlantic and Europe block | NOAA GFS on AWS (`noaa-gfs-bdp-pds`), newest 00/06/12/18Z run with T+120 published; hourly to T+120; 2 m temperature, 10 m wind (speed, barbs) and rain, fetched by range requests on each step's `.idx` |
+| GFS 0.25 (NOAA) | 0.25 deg lat/lon, same block | Same run, 0.25 deg product: MSLP (isobars, centres), surface-based CAPE, gust (instantaneous: GFS has no hourly maximum gust) |
 | Global | 10 km lat/lon | Newest run (every 6 h) whose T+54 is published; files come as layers need them (about 6 MB per field per hour) |
 | IBI waves | about 3 km lat/lon, 19W-5E, 26-56N | Copernicus Marine `IBI_ANALYSISFORECAST_WAV_005_005`, today 00Z to +72 h; significant wave height and mean wave direction (arrows point where the waves go) |
 
@@ -83,6 +85,15 @@ ECMWF has the same layers as UKV except 1-hour rain: its steps are
 accumulation. Its gust is the maximum over the hour before each step to
 T+90 (`10fg`), then over the 3 hours before it (`10fg3`); its CAPE is
 most-unstable CAPE (`mucape`). Data: ECMWF open data, CC BY 4.0.
+
+GFS is listed as two models because its two products are on different
+grids (fields from `sflux` where it has them, otherwise from 0.25 deg,
+as in `reference/NOAA_GFS_S3_surface_fields_guide.md`); each is drawn
+on its own grid. GFS rain: `sflux` PRATE is a mean rate since the last
+6-hourly reset, so each hour's amount is the step between consecutive
+(rate x duration) totals; the hourly amounts add up to GFS's own 6-hour
+total (checked to 0.01 mm). Steps below zero from rounding are set to
+zero.
 
 HARMONIE winds are turned from the rotated grid to true north; its
 hourly rain is the step in its run accumulation (field 61). P3 has no
@@ -157,6 +168,7 @@ near-instant.
 | `globe_pressure.py` | High/low centres, copied from the UKMO NWP tools |
 | `globe_icon.py` | ICON-EU (DWD): latest run, fetching and converting files |
 | `globe_ecmwf.py` | ECMWF IFS 0.1 deg open data: latest run, fetching fields |
+| `globe_gfs.py` | NOAA GFS (sflux and 0.25 deg) on AWS: latest run, fetching fields |
 | `globe_fetch.py` | Fetching HARMONIE (KNMI) and IBI waves (Copernicus Marine) |
 | `globe.py` | The Qt window and the command line |
 
