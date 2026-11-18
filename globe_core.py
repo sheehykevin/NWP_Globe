@@ -23,9 +23,8 @@ from __future__ import annotations
 import os
 import shutil
 import threading
-import time as _time
 import warnings
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import contourpy
 import geovista as gv
@@ -38,12 +37,8 @@ import globe_data as data
 from globe_pressure import find_pressure_centres
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# Default: the UKMO NWP tools' archive next to this project.
-ARCHIVE = os.path.normpath(os.path.join(HERE, "..", "ukmo_nwp", "data",
-                                        "archive"))
 CACHE = os.path.join(HERE, "cache")
 CACHE_VERSION = 7                   # bump when prepared data changes
-KEEP_CACHED_RUNS = 6
 
 RAIN = "precipitation_accumulation"
 MSLP = "pressure_at_mean_sea_level"
@@ -527,17 +522,6 @@ def _load_item(path):
         return mesh, (pts if len(pts) else None, list(f["label_txt"]))
 
 
-def _prune_cache():
-    """Keep the newest few runs' prepared items."""
-    try:
-        runs = [d for d in os.scandir(CACHE) if d.is_dir()]
-    except OSError:
-        return
-    runs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
-    for d in runs[KEEP_CACHED_RUNS:]:
-        shutil.rmtree(d.path, ignore_errors=True)
-
-
 def _set_opacity(actor, value):
     """Opacity for a mesh actor or a label actor."""
     try:
@@ -549,73 +533,90 @@ def _set_opacity(actor, value):
             pass
 
 
-class Scene:
-    """All layers of both models on one GeoVista plotter."""
+class LoadedModel:
+    """A model's run, files and grid, made off the window thread."""
 
-    def __init__(self, pl, ukv_run=None, global_run=None, valid=None,
-                 area="atlantic", base="grey", view="ireland",
-                 archive=None):
-        self.pl = pl
-        archive = archive or ARCHIVE
-        given = {"ukv": ukv_run, "global": global_run}
-        self.runs = {}
-        for m in MODEL_ORDER:
-            try:
-                self.runs[m] = given.get(m) or data.latest_run(m, archive)
-            except SystemExit:
-                if m in ("ukv", "global"):
-                    raise
-        data.prune_downloads(keep_run=self.runs["global"])
-        self.files = {m: data.Files(m, r, archive)
-                      for m, r in self.runs.items()}
-        self.grids = {m: self._grid(m, area) for m in self.runs}
-        self.models = [m for m in MODEL_ORDER if self.grids.get(m)]
-        self.order = list(self.models)          # top model first
-        # Each model lists the layers it has data for.
-        self.styles = {m: [s for s in STYLES if ((m == "ibi") == (s in WAVES))
-                           and all(self.files[m].expected(p)
-                                   for p in needs(s))]
-                       for m in self.models}
+    def __init__(self, model, run, area="atlantic", archive=None):
+        self.model, self.run = model, run
+        self.files = data.Files(model, run, archive)
+        self.grid = _make_grid(model, self.files, run, area)
+        self.styles = [s for s in STYLES
+                       if ((model == "ibi") == (s in WAVES))
+                       and all(self.files.expected(p) for p in needs(s))]
 
-        # Time axis: every valid time any model has (or, for Global,
-        # publishes): hourly, then 3-hourly in the Global tail.
-        times = set()
-        for m in self.models:
-            for param in {p for s in self.styles[m] for p in needs(s)}:
-                times |= {v for v, _ in self.files[m].expected(param)}
-        self.times = sorted(times)
-        if valid:
-            start = data.stamp(valid)
-            if start not in self.times:
-                raise SystemExit(f"No data valid {valid}")
+
+def _make_grid(model, files, run, area):
+    params = {"ibi": [STYLES["waves"]["param"]]}.get(model,
+                                                     [MSLP, RAIN, WIND])
+    path = None
+    for param in params:
+        held = files.held(param)
+        if held:
+            path = next(iter(held.values()))
+            break
+    if path is None and files.can_download:
+        path = files.path(MSLP, data.stamp(run))       # one small file
+    if path is None:
+        raise RuntimeError(f"No {data.MODELS[model]['label']} files for "
+                           f"{run}")
+    if model == "ukv":
+        return UkvGrid(path)
+    if model == "harmonie":
+        return RotatedGrid(path)
+    if model == "global":
+        return GlobalGrid(path, AREAS[area])
+    return GlobalGrid(path, None, wrap=False, km=ARROW_KM)
+
+
+def load_model(model, run=None, area="atlantic", archive=None):
+    """Find the latest run (Met Office models) and build the model; for
+    HARMONIE and IBI the run must already be fetched into the session."""
+    if run is None:
+        if data.MODELS[model]["prefix"]:
+            run = data.latest_run(model)
         else:
-            ukv = {v for v, _ in self.files["ukv"].held(RAIN)}
-            both = [t for t in self.times if t in ukv
-                    and t > data.stamp(self.runs["global"])]
-            start = both[0] if both else self.times[0]
-        self.i = self.times.index(start)
+            runs = data.held_runs(model)
+            run = runs[-1] if runs else None
+    if run is None:
+        raise RuntimeError(f"No {data.MODELS[model]['label']} run found")
+    return LoadedModel(model, run, area, archive)
 
-        self.layers = [layer_id(m, s) for m in self.models
-                       for s in self.styles[m]]
-        self.visible = {lid: STYLES[split_id(lid)[1]].get("visible", False)
-                        for lid in self.layers}
-        self.model_on = {m: True for m in self.models}
-        self.opacity = {lid: STYLES[split_id(lid)[1]].get("opacity", 1.0)
-                        for lid in self.layers}
+
+# Value labels: format per layer, and at most this many on screen.
+LABEL_FORMAT = {"rain_1h": ".1f", "rain_3h": ".1f", "rain_6h": ".1f",
+                "rain_24h": ".0f", "rain_run": ".0f", "waves": ".1f"}
+MAX_LABELS = 400
+LABEL_KM = 10.0
+EARTH_KM = 6371.0
+
+
+class Scene:
+    """All loaded models' layers on one GeoVista plotter."""
+
+    def __init__(self, pl, area="atlantic", base="grey", view="ireland"):
+        self.pl = pl
+        self.area = area
+        self.runs, self.files, self.grids, self.styles = {}, {}, {}, {}
+        self.models, self.order = [], []      # loaded; order top first
+        self.times = []
+        self.i = 0
+        self.layers = []
+        self.visible, self.opacity, self.model_on = {}, {}, {}
+        self.label_on = {}
         self.rasters = {}                       # lid -> drawn mesh actor
-        self.lines = {lid: [] for lid in self.layers}
+        self.lines = {}
+        self.value_actors = {}
+        self.label_note = ""
         self.cache = {}                         # (lid, t) -> item or None
         self.claimed = set()
         self.rain = {}                          # (model, end, period)
+        self.centres_xyz = {}                   # model -> cell centres
         self.lock = threading.Lock()
         self.wake = threading.Event()
         self.dirty = False
-        self.disk = os.path.join(
-            CACHE, f"v{CACHE_VERSION}_" + "_".join(
-                self.runs[m] for m in self.models) + f"_{area}")
+        self.disk = os.path.join(CACHE, "session")
+        shutil.rmtree(self.disk, ignore_errors=True)
         os.makedirs(self.disk, exist_ok=True)
-        os.utime(self.disk)                     # newest for pruning
-        _prune_cache()
 
         # GeoVista checks the graphics card's opacity support (about
         # 1.4 s, by starting a program) on every add_mesh that sets an
@@ -632,8 +633,7 @@ class Scene:
         pl.set_background("#0b1020")
         texture = gv.natural_earth_1() if base == "colour" else grey_texture()
         pl.add_base_layer(texture=texture, zlevel=0)
-        pl.add_coastlines(color="black", line_width=1,
-                         zlevel=2 + 2 * len(RASTERS) * len(self.order) + 2)
+        pl.add_coastlines(color="black", line_width=1, zlevel=self._z_top())
 
         lon, lat, zoom = ATLANTIC if view == "atlantic" else HOME
         self.go_to(lon, lat, zoom)
@@ -641,33 +641,44 @@ class Scene:
         # Terrain style turns the globe about its axis and tilts it,
         # never rolls it: north stays up while dragging.
         pl.enable_terrain_style(mouse_wheel_zooms=True, shift_pans=True)
+        self.show()
 
-    def _grid(self, model, area):
-        if model == "global":
-            return self._global_grid(area)
-        params = {"ibi": [STYLES["waves"]["param"]]}.get(
-            model, [MSLP, RAIN, WIND])
-        for param in params:
-            held = self.files[model].held(param)
-            if held:
-                path = next(iter(held.values()))
-                if model == "ukv":
-                    return UkvGrid(path)
-                if model == "harmonie":
-                    return RotatedGrid(path)
-                return GlobalGrid(path, None, wrap=False, km=ARROW_KM)
-        return None
-
-    def _global_grid(self, area):
-        f = self.files["global"]
-        for param in (MSLP, RAIN):
-            held = f.held(param)
-            if held:
-                return GlobalGrid(next(iter(held.values())), AREAS[area])
-        path = f.path(MSLP, data.stamp(self.runs["global"]))
-        if path is None:
-            raise SystemExit(f"Global run {self.runs['global']} not found")
-        return GlobalGrid(path, AREAS[area])
+    # ---- models ----
+    def add_model(self, lm):
+        """Add a loaded model (window thread). Its layers start with the
+        viewer's defaults; the time axis grows to cover it."""
+        m = lm.model
+        with self.lock:
+            self.runs[m], self.files[m] = lm.run, lm.files
+            self.grids[m], self.styles[m] = lm.grid, lm.styles
+            if m not in self.models:
+                self.models.append(m)
+                rank = MODEL_ORDER.index
+                self.order = sorted(self.models, key=rank)
+            self.model_on.setdefault(m, True)
+            for s in lm.styles:
+                lid = layer_id(m, s)
+                if lid not in self.layers:
+                    self.layers.append(lid)
+                    self.visible[lid] = STYLES[s].get("visible", False)
+                    self.opacity[lid] = STYLES[s].get("opacity", 1.0)
+                    self.label_on[lid] = False
+                    self.lines[lid] = []
+                    self.value_actors[lid] = []
+        old = self.times[self.i] if self.times else None
+        times = set()
+        for mm in self.models:
+            for param in {p for s in self.styles[mm] for p in needs(s)}:
+                times |= {v for v, _ in self.files[mm].expected(param)}
+        self.times = sorted(times)
+        if old in self.times:
+            self.i = self.times.index(old)
+        else:                                    # nearest to now
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            self.i = int(np.argmin([abs((t - now).total_seconds())
+                                    for t in self.times]))
+        self.wake.set()
+        self.show()
 
     # ---- view ----
     def go_to(self, lon, lat, zoom):
@@ -678,6 +689,7 @@ class Scene:
     def go_home(self):
         self.pl.camera_position = self.home
         self.pl.render()
+        self.update_labels()
 
     def north_up(self, render=True):
         cam = self.pl.camera
@@ -700,6 +712,10 @@ class Scene:
         self.wake.set()
         self.show(render=render)
 
+    def set_labels(self, lid, on, render=True):
+        self.label_on[lid] = bool(on)
+        self.update_labels(render=render)
+
     def set_opacity(self, lid, value, render=True):
         self.opacity[lid] = float(value)
         actors = self.lines[lid] + ([self.rasters[lid]]
@@ -709,18 +725,22 @@ class Scene:
         if render:
             self.pl.render()
 
+    @staticmethod
+    def _z_top():
+        return 2 + 2 * len(RASTERS) * len(MODEL_ORDER) + 2
+
     def _z(self, lid):
         """Height of a layer: rasters of the upper model above those of
-        the lower one; lines above all rasters."""
-        # GeoVista heights are whole steps of 1/10000 of the radius
-        # (about 0.6 km); two steps apart keeps the depth order clear.
+        the lower one; lines above all rasters. GeoVista heights are
+        whole steps of 1/10000 of the radius (about 0.6 km); two steps
+        apart keeps the depth order clear."""
         model, style = split_id(lid)
         rank = len(self.order) - 1 - self.order.index(model)
         if STYLES[style]["kind"] == "raster":
             return 2 + 2 * (rank * len(RASTERS) + RASTERS.index(style))
-        base = 2 + 2 * len(RASTERS) * len(self.order) + 4
-        return base + {"isobars": 0, "barbs": 10, "arrows": 10,
-                       "centres": 20}[STYLES[style]["kind"]] + 2 * rank
+        return self._z_top() + 2 + {"isobars": 0, "barbs": 10, "arrows": 10,
+                                    "centres": 20}[STYLES[style]["kind"]] \
+            + 2 * rank
 
     def _add_raster(self, lid, mesh):
         style = STYLES[split_id(lid)[1]]
@@ -735,7 +755,8 @@ class Scene:
 
     def set_order(self, order, render=True):
         """Models top first; redraws the rasters at their new heights."""
-        self.order = [m for m in order if m in self.models]
+        self.order = [m for m in order if m in self.models] + [
+            m for m in self.order if m not in order]
         for lid, actor in list(self.rasters.items()):
             mesh = actor.mapper.dataset
             visible = actor.GetVisibility()
@@ -746,9 +767,11 @@ class Scene:
     # ---- time ----
     @property
     def time(self):
-        return self.times[self.i]
+        return self.times[self.i] if self.times else None
 
     def go(self, i, render=True):
+        if not self.times:
+            return
         self.i = int(np.clip(i, 0, len(self.times) - 1))
         self.wake.set()
         self.show(render=render)
@@ -772,9 +795,9 @@ class Scene:
             threading.Thread(target=self._work, daemon=True).start()
 
     def _next_job(self):
-        on = [lid for lid in self.layers if self.is_on(lid)]
         best = None
         with self.lock:
+            on = [lid for lid in self.layers if self.is_on(lid)]
             for k, t in enumerate(self.times):
                 for rank, lid in enumerate(on):
                     key = (lid, t)
@@ -788,7 +811,7 @@ class Scene:
         return best[1] if best else None
 
     def _work(self):
-        while True:
+        while not data.CLOSING.is_set():
             job = self._next_job()
             if job is None:
                 self.wake.wait(0.5)
@@ -807,13 +830,15 @@ class Scene:
 
     def prepare(self, lid, t):
         """One layer at one time, from disk if saved, else computed."""
+        model = split_id(lid)[0]
         saved = os.path.join(self.disk, f"{lid.replace(':', '_')}_"
+                                        f"{self.runs[model]}_"
                                         f"{t:%Y%m%dT%H%MZ}.npz")
         try:
             value = _load_item(saved)
         except (OSError, KeyError, ValueError):
             value = self._compute(lid, t)
-            if value is not None:
+            if value is not None and not data.CLOSING.is_set():
                 try:
                     _save_item(saved, value)
                 except OSError as exc:
@@ -862,40 +887,46 @@ class Scene:
             left -= fits[0]
         return total
 
+    def raster_values(self, lid, t):
+        """The values a raster layer shows at ``t`` (model units after
+        the layer's scaling), on the model's own cells."""
+        model, name = split_id(lid)
+        style = STYLES[name]
+        if "hours" in style:
+            hours = style["hours"]
+            if hours == "run":
+                hours = lead_hours(t, self.runs[model])
+            if hours <= 0:
+                return None
+            return self.rain_total(model, t, hours)
+        return self._field(model, style["param"], t,
+                           style.get("scale", 1.0), style.get("offset", 0.0))
+
     def _compute(self, lid, t):
         model, name = split_id(lid)
         style, grid = STYLES[name], self.grids[model]
         if style["kind"] == "raster":
-            if "hours" in style:
-                hours = style["hours"]
-                if hours == "run":
-                    hours = lead_hours(t, self.runs[model])
-                if hours <= 0:
-                    return None
-                values = self.rain_total(model, t, hours)
-            else:
-                values = self._field(model, style["param"], t,
-                                     style.get("scale", 1.0),
-                                     style.get("offset", 0.0))
+            values = self.raster_values(lid, t)
             if values is None:
                 return None
             return classes(values, style["levels"], style.get("clear_below"))
-        if style["kind"] == "barbs":
-            speed = self._field(model, WIND, t, MS_TO_KT)
-            dirn = self._field(model, WDIR, t)
-            if speed is None or dirn is None:
+        if style["kind"] in ("barbs", "arrows"):
+            if style["kind"] == "barbs":
+                speed = self._field(model, WIND, t, MS_TO_KT)
+                dirn = self._field(model, WDIR, t)
+            else:
+                speed = None
+                dirn = self._field(model, style["param"], t)
+            if dirn is None or (style["kind"] == "barbs" and speed is None):
                 return None
             cut = grid.barb_cut
-            mesh = barb_mesh(grid.barb_lon, grid.barb_lat,
-                             speed[cut].ravel(), dirn[cut].ravel())
+            if style["kind"] == "barbs":
+                mesh = barb_mesh(grid.barb_lon, grid.barb_lat,
+                                 speed[cut].ravel(), dirn[cut].ravel())
+            else:
+                mesh = arrow_mesh(grid.barb_lon, grid.barb_lat,
+                                  dirn[cut].ravel())
             return mesh, (None, [])
-        if style["kind"] == "arrows":
-            dirn = self._field(model, style["param"], t)
-            if dirn is None:
-                return None
-            cut = grid.barb_cut
-            return arrow_mesh(grid.barb_lon, grid.barb_lat,
-                              dirn[cut].ravel()), (None, [])
         hpa = self._field(model, MSLP, t, 0.01)
         if hpa is None:
             return None
@@ -918,6 +949,76 @@ class Scene:
         return pv.PolyData(), (pts, [f"{c['letter']} {c['pressure']:.0f}"
                                      for c in found])
 
+    # ---- value labels ----
+    def _cell_centres(self, model):
+        """Unit-globe points of every cell centre of a model's grid."""
+        if model not in self.centres_xyz:
+            g = self.grids[model]
+            xx, yy = np.meshgrid(g.x, g.y)
+            lon, lat = g.lonlat(xx.ravel(), yy.ravel())
+            self.centres_xyz[model] = xyz(np.asarray(lon), np.asarray(lat))
+        return self.centres_xyz[model]
+
+    def update_labels(self, render=True):
+        """Label raw cell values of layers with labels on, for the part
+        of the globe in view: cells about 10 km apart, or wider when that
+        would mean more than MAX_LABELS labels."""
+        pl, t = self.pl, self.time
+        for lid, actors in self.value_actors.items():
+            for actor in actors:
+                pl.remove_actor(actor, render=False)
+            actors.clear()
+        wanted = [lid for lid in self.layers
+                  if self.label_on.get(lid) and self.is_on(lid)
+                  and STYLES[split_id(lid)[1]]["kind"] == "raster"]
+        self.label_note = ""
+        if not wanted or t is None:
+            if render:
+                pl.render()
+            return
+        cam = pl.camera
+        pos = np.asarray(cam.position, dtype=float)
+        dist = np.linalg.norm(pos)
+        look = pos / dist                        # globe point under view
+        half = np.radians(cam.view_angle) / 2.0
+        # Angular radius of the globe in view (small-angle estimate).
+        cap = min(np.arcsin(min(1.0, 1.0 / dist)),
+                  (dist - 1.0) * np.tan(half) * 1.3)
+        area = np.pi * (cap * EARTH_KM) ** 2
+        km = max(LABEL_KM, float(np.sqrt(area / MAX_LABELS)))
+        self.label_note = f"labels every {km:.0f} km"
+        box = km / EARTH_KM
+        for lid in wanted:
+            model, name = split_id(lid)
+            values = self.raster_values(lid, t)
+            if values is None:
+                continue
+            values = np.asarray(values).ravel()
+            pts = self._cell_centres(model)
+            inside = np.flatnonzero(pts @ look > np.cos(cap))
+            if not inside.size:
+                continue
+            style = STYLES[name]
+            v = values[inside]
+            keep = np.isfinite(v)
+            if style.get("clear_below") is not None:
+                keep &= v >= style["clear_below"]
+            inside = inside[keep]
+            if not inside.size:
+                continue
+            # One cell per box of the label spacing.
+            cell = np.floor(pts[inside] / box).astype(np.int64)
+            _, first = np.unique(cell, axis=0, return_index=True)
+            chosen = inside[first][:MAX_LABELS * 2]
+            fmt = LABEL_FORMAT.get(name, ".0f")
+            self.value_actors[lid].append(pl.add_point_labels(
+                pts[chosen] * 1.003,
+                [format(values[k], fmt) for k in chosen],
+                font_size=9, text_color="#101010", shape=None,
+                show_points=False, always_visible=False, render=False))
+        if render:
+            pl.render()
+
     # ---- drawing ----
     def refresh(self):
         """Redraw if something for the shown time became ready."""
@@ -927,7 +1028,7 @@ class Scene:
 
     def show(self, render=True, block=False):
         pl, t = self.pl, self.time
-        for lid in self.layers:
+        for lid in list(self.layers):
             model, name = split_id(lid)
             style = STYLES[name]
             on = self.is_on(lid)
@@ -980,12 +1081,13 @@ class Scene:
                 _set_opacity(actor, self.opacity[lid])
         pl.add_text(self.caption(), position="upper_left", font_size=10,
                     color="white", name="title")
+        self.update_labels(render=False)
         if render:
             pl.render()
 
     def leads_text(self):
         t, out = self.time, []
-        for m in self.models:
+        for m in self.order:
             label = data.MODELS[m]["label"]
             lead = lead_hours(t, self.runs[m])
             has = any(v == t for p in {q for s in self.styles[m]
@@ -996,14 +1098,8 @@ class Scene:
         return ", ".join(out)
 
     def caption(self):
+        if self.time is None:
+            return ("No model loaded: press a model's download button in "
+                    "the layer panel.\nPrototype.")
         return (f"Valid {self.time:%a %d %b %H:%M} UTC\n{self.leads_text()}"
                 "\nNative model cells, no resampling. Prototype.")
-
-
-def wait_until_idle(scene, timeout=600):
-    """Testing helper: prepare every switched-on layer at the shown time."""
-    t0 = _time.time()
-    for lid in scene.layers:
-        if scene.is_on(lid):
-            scene.prepare(lid, scene.time)
-    return _time.time() - t0

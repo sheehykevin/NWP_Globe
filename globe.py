@@ -1,13 +1,15 @@
-"""3D globe for UKV and Global model output (prototype).
+"""3D globe for weather and wave model output (prototype).
 
-A Qt window around the globe in ``globe_core.py``: a layer panel with
-one group per model (drag a group above the other to draw that model on
-top; each layer has on/off, transparency and its colour key) and a time
-bar (first, back, play, forward, last, a time slider and play speed),
-as in the UKMO NWP viewer.
+A Qt window around the globe in ``globe_core.py``. It opens empty: each
+model's group in the layer panel has a download button that fetches its
+latest run, and everything downloaded is deleted when the window closes.
+Drag a group above another to draw that model on top; each layer has
+on/off, value labels, transparency and its colour key. The time bar has
+first, back, play, forward, last, a time slider and play speed, as in
+the UKMO NWP viewer.
 
     conda env create -f environment.yml
-    conda run -n ukmo_globe python globe.py [--archive PATH]
+    conda run -n ukmo_globe python globe.py
 
 Keys: Left/Right one step, Up/Down six hours, Space play/pause, Home and
 End first/last time, h home view (Ireland, north up), n north up.
@@ -80,29 +82,52 @@ def colour_key(style, QtGui, QtCore):
     return pix
 
 
+def download_icon(QtGui, QtCore, size=18):
+    """A box with a down arrow, for the per-model download buttons."""
+    pix = QtGui.QPixmap(size, size)
+    pix.fill(QtCore.Qt.transparent)
+    p = QtGui.QPainter(pix)
+    p.setRenderHint(QtGui.QPainter.Antialiasing)
+    pen = QtGui.QPen(QtGui.QColor("#2b5fb4"))
+    pen.setWidth(2)
+    p.setPen(pen)
+    s = size
+    p.drawRect(2, int(s * 0.45), s - 4, int(s * 0.5) - 2)    # the box
+    p.drawLine(s // 2, 1, s // 2, int(s * 0.7))               # shaft
+    p.drawLine(s // 2, int(s * 0.7), s // 2 - 4, int(s * 0.7) - 4)
+    p.drawLine(s // 2, int(s * 0.7), s // 2 + 4, int(s * 0.7) - 4)
+    p.end()
+    return QtGui.QIcon(pix)
+
+
 def run_window(args):
+    import os
+    import queue
+    import threading
+
     from geovista.qt import GeoQtInteractor
     from qtpy import QtCore, QtGui, QtWidgets
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     app.setStyle("Fusion")
     app.setStyleSheet(STYLE_SHEET)
+    data.clear_session()                     # left over from a crash
 
     win = QtWidgets.QMainWindow()
     win.setWindowTitle("UKMO NWP Globe")
     win.resize(1500, 950)
     view = GeoQtInteractor()
     win.setCentralWidget(view)
-    scene = core.Scene(view, ukv_run=args.ukv_run,
-                       global_run=args.global_run, valid=args.valid,
-                       area=args.area, base=args.base, view=args.view,
-                       archive=args.archive)
+    scene = core.Scene(view, area=args.area, base=args.base, view=args.view)
     # PyVista zooms on Up/Down by default; here they step time.
     for key in ("Up", "Down"):
         view.clear_events_for_key(key)
 
     # ---- layer panel: one group per model, drag to reorder ----
-    collapsed = {m: False for m in scene.models}
+    collapsed = {m: False for m in data.MODELS}
+    panel_order = list(core.MODEL_ORDER)        # top first, loaded or not
+    fetching = {}                               # model -> note text
+    done = queue.Queue()                        # (model, LoadedModel|error)
 
     def model_group(model):
         box = QtWidgets.QFrame()
@@ -111,22 +136,40 @@ def run_window(args):
         lay.setSpacing(2)
         head = QtWidgets.QHBoxLayout()
         grip = QtWidgets.QLabel("☰")
-        grip.setToolTip("Drag to draw this model above or below the other")
+        grip.setToolTip("Drag to draw this model above or below the others")
         grip.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
         grip.setStyleSheet("color:#777;font-size:12pt")
-        on = QtWidgets.QCheckBox(f"{data.MODELS[model]['label']}  "
-                                 f"{scene.runs[model]}")
+        loaded = model in scene.models
+        title = data.MODELS[model]["label"] + (
+            f"  {scene.runs[model]}" if loaded else "")
+        on = QtWidgets.QCheckBox(title)
         on.setStyleSheet("font-weight:bold")
-        on.setChecked(scene.model_on[model])
+        on.setChecked(scene.model_on.get(model, True))
+        on.setEnabled(loaded)
         on.toggled.connect(lambda v, m=model: scene.set_model_on(m, v))
+        get = QtWidgets.QToolButton()
+        get.setIcon(download_icon(QtGui, QtCore))
+        get.setToolTip("Fetch the latest run" if not loaded
+                       else "Fetch the latest run again")
+        get.setEnabled(model not in fetching)
+        get.clicked.connect(lambda _=False, m=model: fetch(m))
         fold = QtWidgets.QToolButton()
         fold.setArrowType(QtCore.Qt.RightArrow if collapsed[model]
                           else QtCore.Qt.DownArrow)
         fold.setAutoRaise(True)
+        fold.setVisible(loaded)
         head.addWidget(grip)
         head.addWidget(on, 1)
+        head.addWidget(get)
         head.addWidget(fold)
         lay.addLayout(head)
+        if not loaded:
+            note = QtWidgets.QLabel(fetching.get(
+                model, "Not loaded: press the download button."))
+            note.setStyleSheet("color:#555;font-size:8pt;margin-left:18px")
+            note.setWordWrap(True)
+            lay.addWidget(note)
+            return box
         body = QtWidgets.QWidget()
         rows = QtWidgets.QGridLayout(body)
         rows.setContentsMargins(18, 0, 0, 0)
@@ -137,12 +180,17 @@ def run_window(args):
             style = STYLES[name]
             tick = QtWidgets.QCheckBox(style["name"])
             tick.setChecked(scene.visible[lid])
+            values = QtWidgets.QCheckBox("123")
+            values.setToolTip("Label the cells' own values (about 10 km "
+                              "apart when zoomed in)")
+            values.setChecked(scene.label_on[lid])
+            values.setVisible(style["kind"] == "raster")
             slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
             slider.setRange(0, 100)
             slider.setValue(int(round(scene.opacity[lid] * 100)))
             slider.setFocusPolicy(QtCore.Qt.NoFocus)
             slider.setToolTip("Opacity")
-            slider.setMaximumWidth(90)
+            slider.setMaximumWidth(70)
             pct = QtWidgets.QLabel(f"{slider.value()}%")
             pct.setMinimumWidth(30)
             key = QtWidgets.QLabel()
@@ -158,11 +206,13 @@ def run_window(args):
                 label.setText(f"{v}%")
                 scene.set_opacity(lid, v / 100.0)
             tick.toggled.connect(toggled)
+            values.toggled.connect(lambda v, lid=lid: scene.set_labels(lid, v))
             slider.valueChanged.connect(moved)
             rows.addWidget(tick, r, 0)
-            rows.addWidget(slider, r, 1)
-            rows.addWidget(pct, r, 2)
-            rows.addWidget(key, r + 1, 0, 1, 3)
+            rows.addWidget(values, r, 1)
+            rows.addWidget(slider, r, 2)
+            rows.addWidget(pct, r, 3)
+            rows.addWidget(key, r + 1, 0, 1, 4)
             r += 2
         body.setVisible(not collapsed[model])
         lay.addWidget(body)
@@ -193,7 +243,7 @@ def run_window(args):
     def build_items():
         groups.blockSignals(True)
         groups.clear()
-        for model in scene.order:
+        for model in panel_order:
             item = QtWidgets.QListWidgetItem()
             item.setData(QtCore.Qt.UserRole, model)
             groups.addItem(item)
@@ -202,34 +252,96 @@ def run_window(args):
         resize_items()
 
     def reordered(*_):
-        order = [groups.item(k).data(QtCore.Qt.UserRole)
-                 for k in range(groups.count())]
-        scene.set_order(order)
+        panel_order[:] = [groups.item(k).data(QtCore.Qt.UserRole)
+                          for k in range(groups.count())]
+        scene.set_order(panel_order)
         # Qt may drop the widgets of moved items: rebuild them all
         # (their state lives in the scene).
         QtCore.QTimer.singleShot(0, build_items)
     groups.model().rowsMoved.connect(reordered)
-    build_items()
+
+    # ---- fetching a model on request ----
+    procs = {}
+
+    def fetch(model):
+        if model in fetching:
+            return
+        if data.MODELS[model]["prefix"]:
+            # Met Office: find the latest run; files then come as layers
+            # need them.
+            fetching[model] = "Finding the latest run ..."
+            build_items()
+
+            def work():
+                try:
+                    done.put((model, core.load_model(model, area=args.area)))
+                except Exception as exc:
+                    done.put((model, exc))
+            threading.Thread(target=work, daemon=True).start()
+            return
+        # HARMONIE / IBI: fetched whole by globe_fetch.py.
+        fetching[model] = "Fetching ..."
+        build_items()
+        proc = QtCore.QProcess(win)
+        proc.setProcessChannelMode(QtCore.QProcess.MergedChannels)
+        last = [""]
+
+        def output():
+            text = bytes(proc.readAll()).decode("utf-8", "replace")
+            lines = [s.strip() for s in text.splitlines() if s.strip()]
+            if lines:
+                last[0] = lines[-1]
+                fetching[model] = last[0][:120]
+                status_note.setText(f"  {data.MODELS[model]['label']}: "
+                                    f"{last[0][:70]}")
+
+        def finished(code, _status):
+            if code == 0:
+                def work():
+                    try:
+                        done.put((model, core.load_model(
+                            model, area=args.area)))
+                    except Exception as exc:
+                        done.put((model, exc))
+                threading.Thread(target=work, daemon=True).start()
+            else:
+                done.put((model, RuntimeError(last[0] or "fetch failed")))
+        proc.readyRead.connect(output)
+        proc.finished.connect(finished)
+        procs[model] = proc
+        what = "harmonie" if model == "harmonie" else "ibi"
+        proc.start(sys.executable, [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "globe_fetch.py"), what])
+
+    def stop_fetches():
+        for proc in procs.values():
+            if proc.state() != QtCore.QProcess.NotRunning:
+                proc.kill()
+                proc.waitForFinished(3000)
+    app.aboutToQuit.connect(stop_fetches)
 
     panel = QtWidgets.QWidget()
     pl_lay = QtWidgets.QVBoxLayout(panel)
     pl_lay.setContentsMargins(2, 2, 2, 2)
-    hint = QtWidgets.QLabel("Drag a model by ☰ to draw it on top.")
+    hint = QtWidgets.QLabel("Press a model's download button to fetch its "
+                            "latest run.\nDrag a model by ☰ to draw it "
+                            "on top.")
     hint.setStyleSheet("color:#555;font-size:8pt")
     pl_lay.addWidget(hint)
     pl_lay.addWidget(groups, 1)
     note = QtWidgets.QLabel("Native model cells, no resampling. Rain "
-                            "windows end at the shown time.\nGlobal files "
-                            "not on disk are downloaded while a layer is "
-                            "on.")
+                            "windows end at the shown time.\nDownloads are "
+                            "deleted when the globe closes.")
     note.setStyleSheet("color:#555;font-size:8pt")
     pl_lay.addWidget(note)
     dock = QtWidgets.QDockWidget("Layers", win)
     dock.setWidget(panel)
     dock.setFeatures(QtWidgets.QDockWidget.DockWidgetMovable
                      | QtWidgets.QDockWidget.DockWidgetFloatable)
-    dock.setMinimumWidth(320)
+    dock.setMinimumWidth(370)
     win.addDockWidget(QtCore.Qt.RightDockWidgetArea, dock)
+    build_items()
 
     # ---- time bar ----
     bar = QtWidgets.QToolBar("Time")
@@ -245,21 +357,25 @@ def run_window(args):
 
     timer = QtCore.QTimer(win)
     slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-    slider.setRange(0, len(scene.times) - 1)
     slider.setFocusPolicy(QtCore.Qt.NoFocus)
-    slider.setMinimumWidth(360)
+    slider.setMinimumWidth(300)
     label = QtWidgets.QLabel()
     label.setMinimumWidth(330)
     status = QtWidgets.QLabel()
+    status_note = QtWidgets.QLabel()
+
+    def sync_slider():
+        slider.blockSignals(True)
+        slider.setRange(0, max(0, len(scene.times) - 1))
+        slider.setValue(scene.i)
+        slider.blockSignals(False)
+        label.setText(f"  {scene.time:%a %d %b %H:%M} UTC   "
+                      f"{scene.leads_text()}" if scene.times
+                      else "  no model loaded")
 
     def go(i):
         scene.go(i)
-        if slider.value() != scene.i:
-            slider.blockSignals(True)
-            slider.setValue(scene.i)
-            slider.blockSignals(False)
-        label.setText(f"  {scene.time:%a %d %b %H:%M} UTC   "
-                      f"{scene.leads_text()}")
+        sync_slider()
 
     def ready_now():
         with scene.lock:
@@ -270,7 +386,7 @@ def run_window(args):
         if timer.isActive():
             timer.stop()
             play.setIcon(style.standardIcon(sp.SP_MediaPlay))
-        else:
+        elif scene.times:
             if scene.i == len(scene.times) - 1:
                 go(0)
             timer.start()
@@ -314,65 +430,42 @@ def run_window(args):
     north.triggered.connect(lambda: scene.north_up())
     bar.addSeparator()
     bar.addWidget(status)
-    bar.addSeparator()
+    bar.addWidget(status_note)
 
-    # ---- fetching HARMONIE and IBI (a separate process) ----
-    import os
-    fetch_proc = QtCore.QProcess(win)
-    fetch_proc.setProcessChannelMode(QtCore.QProcess.MergedChannels)
-    fetch_btn = QtWidgets.QToolButton()
-    fetch_btn.setText("Fetch")
-    fetch_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
-    fetch_menu = QtWidgets.QMenu(fetch_btn)
-    fetch_btn.setMenu(fetch_menu)
-    bar.addWidget(fetch_btn)
-    fetch_note = QtWidgets.QLabel()
-    bar.addWidget(fetch_note)
-
-    def fetch(what):
-        if fetch_proc.state() != QtCore.QProcess.NotRunning:
-            return
-        fetch_note.setText(f"  fetching {what} ...")
-        fetch_proc.start(sys.executable, [
-            os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         "globe_fetch.py"), what])
-
-    last = [""]
-
-    def fetch_output():
-        text = bytes(fetch_proc.readAll()).decode("utf-8", "replace")
-        lines = [s for s in text.splitlines() if s.strip()]
-        if lines:
-            last[0] = lines[-1].strip()
-            fetch_note.setText("  " + last[0][:90])
-
-    def fetch_done(code, _status):
-        if code == 0:
-            fetch_note.setText("  fetched: Fetch > Reload the globe")
-        else:
-            fetch_note.setText("  fetch failed: " + last[0][:90])
-        fetch_note.setToolTip(last[0])
-    fetch_proc.readyRead.connect(fetch_output)
-    fetch_proc.finished.connect(fetch_done)
-    fetch_menu.addAction("HARMONIE: latest KNMI run (about 3.4 GB "
-                         "download)", lambda: fetch("harmonie"))
-    fetch_menu.addAction("IBI waves: today 00Z to +72 h",
-                         lambda: fetch("ibi"))
-    fetch_menu.addSeparator()
-
-    def reload():
-        # A fresh window reads every model's newest run again.
-        QtCore.QProcess.startDetached(sys.executable, sys.argv)
-        app.quit()
-    fetch_menu.addAction("Reload the globe", reload)
+    last_cam = [None, None]
 
     def poll():
+        # A model finished fetching?
+        while not done.empty():
+            model, result = done.get()
+            fetching.pop(model, None)
+            if isinstance(result, Exception):
+                fetching_msg = f"Fetch failed: {result}"
+                status_note.setText(f"  {data.MODELS[model]['label']}: "
+                                    f"{fetching_msg[:80]}")
+            else:
+                scene.add_model(result)
+                scene.set_order(panel_order)
+                status_note.setText(f"  {data.MODELS[model]['label']} "
+                                    f"{result.run} loaded")
+            build_items()
+            sync_slider()
         scene.refresh()
+        # Relabel values after the camera has moved and settled.
+        cam = tuple(round(v, 4) for v in scene.pl.camera.position)
+        if cam != last_cam[0]:
+            last_cam[0] = cam
+        elif cam != last_cam[1]:
+            last_cam[1] = cam
+            if any(scene.label_on.values()):
+                scene.update_labels()
         ready, wanted, downloading = scene.status()
         text = (f"  {ready}/{wanted} ready" if ready < wanted
-                else "  all ready")
+                else "  all ready") if wanted else ""
         if downloading:
             text += f", downloading {downloading}"
+        if scene.label_note and any(scene.label_on.values()):
+            text += f", {scene.label_note}"
         status.setText(text)
     poller = QtCore.QTimer(win)
     poller.timeout.connect(poll)
@@ -394,9 +487,11 @@ def run_window(args):
         sc.setContext(QtCore.Qt.ApplicationShortcut)
         sc.activated.connect(slot)
 
-    go(scene.i)
+    sync_slider()
     scene.start_workers()
     win.show()
+    for model in args.load:                     # optional, at start
+        fetch(model)
     if args.smoke:
         # Testing: save a picture of the whole window, then close.
         def grab():
@@ -405,57 +500,72 @@ def run_window(args):
             print("wrote", args.smoke)
             app.quit()
         QtCore.QTimer.singleShot(args.smoke_wait * 1000, grab)
-    return app.exec_()
+    code = app.exec_()
+    # Downloads are for this session only.
+    data.clear_session(wait=10.0)
+    import shutil
+    shutil.rmtree(scene.disk, ignore_errors=True)
+    return code
 
 
 def run_screenshot(args):
     import geovista as gv
+    data.clear_session()
     pl = gv.GeoPlotter(off_screen=True, window_size=(1400, 1000))
-    scene = core.Scene(pl, ukv_run=args.ukv_run, global_run=args.global_run,
-                       valid=args.valid, area=args.area, base=args.base,
-                       view=args.view, archive=args.archive)
+    scene = core.Scene(pl, area=args.area, base=args.base, view=args.view)
+    for model in args.load:
+        scene.add_model(core.load_model(model, area=args.area))
     for lid in args.show:
         scene.visible[lid] = True
     for lid in args.hide:
         scene.visible[lid] = False
+    for lid in args.labels:
+        scene.label_on[lid] = True
     if args.order:
         scene.order = [m for m in args.order if m in scene.models] + [
             m for m in scene.order if m not in args.order]
+    if args.valid:
+        scene.i = scene.times.index(data.stamp(args.valid))
     if args.steps:
         scene.i = min(scene.i + args.steps, len(scene.times) - 1)
     scene.show(render=False, block=True)
     pl.show(screenshot=args.screenshot)
     print("wrote", args.screenshot, "valid", scene.time)
+    if not args.keep:
+        data.clear_session()
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--archive", default=core.ARCHIVE,
-                    help="UKMO NWP tools' download archive, read only "
-                    "(default: %(default)s)")
-    ap.add_argument("--ukv-run", help="default: newest held")
-    ap.add_argument("--global-run", help="default: newest held; any "
-                    "published run can be given (it is downloaded)")
-    ap.add_argument("--valid", help="start time, e.g. 20261116T0300Z "
-                    "(default: first hour both models cover)")
+    ap.add_argument("--load", nargs="*", default=[],
+                    choices=list(data.MODELS), metavar="MODEL",
+                    help="models to fetch at start (default: none; use the "
+                    "download buttons)")
     ap.add_argument("--base", choices=["grey", "colour"], default="grey")
     ap.add_argument("--area", choices=sorted(core.AREAS), default="atlantic",
                     help="Global area drawn (default: %(default)s)")
     ap.add_argument("--view", choices=["ireland", "atlantic"],
                     default="ireland")
-    ap.add_argument("--screenshot", help="testing: draw off screen, write "
-                    "a PNG of the globe and exit")
+    ap.add_argument("--screenshot", help="testing: draw off screen the "
+                    "--load models, write a PNG and exit")
+    ap.add_argument("--valid", help="with --screenshot: valid time, e.g. "
+                    "20261118T1200Z")
     ap.add_argument("--show", nargs="*", default=[], choices=ALL_LAYERS,
                     metavar="MODEL:LAYER",
                     help="with --screenshot: layers on, e.g. global:cape")
     ap.add_argument("--hide", nargs="*", default=[], choices=ALL_LAYERS,
                     metavar="MODEL:LAYER",
                     help="with --screenshot: layers off")
+    ap.add_argument("--labels", nargs="*", default=[], choices=ALL_LAYERS,
+                    metavar="MODEL:LAYER",
+                    help="with --screenshot: layers with value labels")
     ap.add_argument("--order", nargs="+", choices=list(data.MODELS),
                     help="with --screenshot: models to draw on top, top "
                     "first (the rest follow)")
     ap.add_argument("--steps", type=int, default=0,
                     help="with --screenshot: time steps to move first")
+    ap.add_argument("--keep", action="store_true",
+                    help="with --screenshot: keep the downloads")
     ap.add_argument("--smoke", help="testing: open the window, save a "
                     "picture of it and close")
     ap.add_argument("--smoke-wait", type=int, default=8,

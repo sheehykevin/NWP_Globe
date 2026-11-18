@@ -57,51 +57,50 @@ own last lead).
 
 ## Models
 
-| Model | Grid | From | Notes |
-|---|---|---|---|
-| UKV | 2 km Lambert equal area | UKMO NWP tools' archive | |
-| HARMONIE (KNMI) | P3 (deterministic): rotated pole, 0.05 deg (about 5.5 km), Europe | KNMI Open Data API `harmonie_arome_cy43_p3`, latest run | Fetch menu; about 3.4 GB streamed per run, only the fields drawn are kept |
-| Global | 10 km lat/lon | archive, then the Met Office AWS bucket | downloads while a layer is on |
-| IBI waves | about 3 km lat/lon, 19W-5E, 26-56N | Copernicus Marine `IBI_ANALYSISFORECAST_WAV_005_005` | Fetch menu; significant wave height and mean wave direction (arrows point where the waves go) |
+The globe opens empty. Each model's group in the layer panel has a
+download button (a box with a down arrow) that fetches that model's
+latest run; nothing is downloaded until you press it. Everything
+downloaded is kept in `data\session` (prepared layers in
+`cache\session`) and deleted when the globe closes, or at the next start
+if it did not close cleanly.
 
-HARMONIE and IBI are fetched by `globe_fetch.py` (also from the window's
-**Fetch** menu, then **Reload the globe**) into `data\` in the same layout
-as the Met Office files. HARMONIE winds are turned from the rotated grid
-to true north; its hourly rain is the step in its run accumulation.
+| Model | Grid | Latest run and download |
+|---|---|---|
+| UKV | 2 km Lambert equal area | Newest run (every 3 h) whose T+54 is published on the Met Office AWS bucket; files come as layers need them |
+| HARMONIE (KNMI) | P3 (deterministic): rotated pole, 0.05 deg (about 5.5 km), Europe | Newest P3 run on the KNMI Open Data API; about 3.4 GB streamed, only the fields drawn are kept (a few minutes to load) |
+| Global | 10 km lat/lon | Newest run (every 6 h) whose T+54 is published; files come as layers need them (about 6 MB per field per hour) |
+| IBI waves | about 3 km lat/lon, 19W-5E, 26-56N | Copernicus Marine `IBI_ANALYSISFORECAST_WAV_005_005`, today 00Z to +72 h; significant wave height and mean wave direction (arrows point where the waves go) |
 
-    conda run -n ukmo_globe python globe_fetch.py harmonie [--run YYYYMMDDHH]
-    conda run -n ukmo_globe python globe_fetch.py ibi [--start YYYYMMDDHH] [--hours 72]
+HARMONIE winds are turned from the rotated grid to true north; its
+hourly rain is the step in its run accumulation (field 61). P3 has no
+CAPE. Each HARMONIE fetch writes `docs\harmonie_inventory.md`, every GRIB
+field in the run.
 
 - **KNMI**: an API key from https://developer.dataplatform.knmi.nl, in the
   `KNMI_API_KEY` environment variable or a `.env` file here with
   `KNMI_API_KEY=...` (git-ignored).
 - **Copernicus Marine**: run `copernicusmarine login` once.
-- Each HARMONIE fetch writes `docs\harmonie_inventory.md`, every GRIB
-  field in the run. Taken: MSLP, 2 m temperature, 10 m wind,
-  hourly-maximum gust, and total precipitation (field 61, accumulated
-  from the run start; hourly amounts are the steps). P3 has no CAPE.
-  Leads T+0 to T+60, hourly.
-
-## Data
-
-Files are looked for in this project's `data\` folder, then in the UKMO
-NWP tools' archive (`--archive`, read only: nothing is written there).
-Global files in neither place are downloaded from the Met Office's
-public AWS bucket into `data\` while a layer that needs them is
-switched on (about 6 MB per field per hour). The newest 2 downloaded
-Global runs are kept. UKV files come only from the archive.
 
 ## The window
 
-**Layers panel** (right): one group per model, with the run. Drag a
-group by ☰ above the other to draw that model on top. Each group has an
-on/off tick for the whole model and an arrow to fold it; each layer has
-a tick, an opacity slider and (when on) its colour key.
+**Layers panel** (right): one group per model. Its header has a drag
+handle (☰: drag above another model to draw it on top), an on/off tick
+for the whole model, the run, the download button and an arrow to fold
+it. Each layer has a tick, a **123** tick box for value labels (coloured
+layers), an opacity slider and (when on) its colour key.
+
+**Value labels**: the cells' own values (no interpolation), about 10 km
+apart, for the part of the globe in view. Zoomed out, the spacing widens
+so no more than about 400 labels are drawn (the status bar says e.g.
+"labels every 40 km"); labels follow time steps and are redrawn after
+the view stops moving. Dry or see-through cells are not labelled.
 
 **Time bar** (bottom): first, back, play/pause, forward, last; the time
 slider; play speed; the valid time and each model's lead; Home view;
-North up; how many layer-hours are ready, and downloads in progress.
-Play waits for a time that is not ready yet and stops at the last one.
+North up; how many layer-hours are ready, downloads in progress, and
+fetch messages. Play waits for a time that is not ready yet and stops at
+the last one. When the first model loads, the time nearest to now is
+shown.
 
 **Mouse**: drag to turn the globe (north stays up), scroll to zoom,
 Shift+drag to pan.
@@ -119,30 +118,29 @@ Shift+drag to pan.
 
 | Option | Meaning |
 |---|---|
-| `--archive PATH` | UKMO NWP tools' archive (default `..\ukmo_nwp\data\archive`) |
-| `--ukv-run`, `--global-run` | Runs to show, e.g. `20261115T2100Z` (default: newest held). Any published Global run can be given; it is downloaded |
-| `--valid TIME` | Starting valid time, e.g. `20261116T0300Z` |
+| `--load MODEL ...` | Fetch these models at start (default: none) |
 | `--base grey` / `colour` | Background: Natural Earth I shaded relief in grey (default) or in colour |
 | `--area atlantic` / `world` | Global area drawn (default `atlantic`: 80°W-50°E, 15-80°N) |
 | `--view ireland` / `atlantic` | Starting view |
 
-For testing: `--screenshot FILE` draws off screen and writes a PNG
-(with `--show` / `--hide MODEL:LAYER ...`, e.g. `global:cape`,
-`--order global ukv`, `--steps N`); `--smoke FILE` opens the window,
-saves a picture of it and closes.
+For testing: `--screenshot FILE --load MODEL ...` draws off screen and
+writes a PNG (with `--valid TIME`, `--show` / `--hide` / `--labels
+MODEL:LAYER ...`, `--order`, `--steps N`, `--keep`); `--smoke FILE`
+opens the window, saves a picture of it and closes. `globe_fetch.py
+harmonie|ibi` fetches from the command line.
 
 ## Speed
 
 Layers are prepared only while switched on, by three background
-workers, nearest times first, and saved in `cache\` (newest 6 runs
-kept), so reopening a run is quick and stepping is near-instant.
+workers, nearest times first; stepping through prepared times is
+near-instant.
 
 ## Files
 
 | File | What it holds |
 |---|---|
 | `globe_core.py` | Layers, rain sums, drawing and background preparation; no window code |
-| `globe_data.py` | Finding files and downloading Global ones |
+| `globe_data.py` | Session folder, latest runs, downloading Met Office files |
 | `globe_pressure.py` | High/low centres, copied from the UKMO NWP tools |
 | `globe_fetch.py` | Fetching HARMONIE (KNMI) and IBI waves (Copernicus Marine) |
 | `globe.py` | The Qt window and the command line |
