@@ -59,6 +59,11 @@ day.
 **Recommended order**: A1, A2, A3, A4, A6, B1, A5, A7, A8, B3, B2, B4,
 then the rest as wanted.
 
+**Status (18 Nov 2026)**: A1–A8 and B1–B10 are implemented and tested
+(commits `d3750f5` … `bf3e8bc`). While doing B1 a crash was found and
+fixed: GRIB decoding is not thread-safe, so every decoder now holds one
+lock (`globe_paths.GRIB_LOCK`). C1–C7 are not started.
+
 ---
 
 # Part 1 – Review items

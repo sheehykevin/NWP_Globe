@@ -38,9 +38,17 @@ Nothing is downloaded until asked for, and everything fetched is kept.
   prepares every layer of its latest run; each layer's own button
   fetches that layer for every hour. The **Models** and **Parameters**
   menus at the top of the panel with **Fetch** fetch the ticked
-  parameters for every ticked model that has them. Fetches run as
-  separate processes; progress shows under the model's name and the
-  model reloads when done.
+  parameters for every ticked model that has them (each parameter
+  says how many of the ticked models have it; models without it are
+  listed in the status bar). Ticking a layer that has not been fetched
+  fetches it. At most two fetches run at once (`GLOBE_MAX_JOBS` to
+  change); the others wait in line. A fetching model's download button
+  becomes a stop button. Fetches run as separate processes with their
+  output in `data\store\jobs\<model>.log`; progress shows under the
+  model's name and the model reloads when done. Closing the window
+  while fetches run asks whether to keep them going in the background;
+  the next window picks them up. A failed fetch shows a **details**
+  link with its output and the likely cause.
 - **From the command line**: `prefetch.bat` (or `globe.py --prefetch`)
   fetches the latest run of every model, or only those named
   (`prefetch.bat ukv ecmwf`), all layers or only those given
@@ -55,7 +63,14 @@ model's) is asked for.
 
 Everything is kept in `data\store` (prepared layers in `cache\store`)
 until a newer run of that model is fetched, which replaces it; models
-in the store open at start. **Clear data** deletes the store.
+in the store open at start. When a newer run is fetched, every layer
+already fetched for the older run is fetched for the new one too, and
+the older run is deleted only after that. Each header shows the run's
+age, and a blue badge (e.g. "18Z available") when the source has
+published a newer run (checked every 15 minutes). The store's size is
+shown beside **Clear data**, which deletes it all; right-click a model
+to clear only that model or see its last fetch's output. Every
+deletion is written to `data\store\log.txt` with its reason.
 
 HARMONIE and the Météo-France packages have no byte index, so the globe
 makes one: it reads the first bytes of each GRIB message with HTTP range
@@ -187,10 +202,20 @@ field in the run.
 handle (☰: drag above another model to draw it on top), an arrow (or
 click the name) to open or fold its layers (folded at start), an on/off
 tick for the whole model, the run (or "no data") and the model's
-download button. Each layer has a tick (greyed until it has data), a
-**123** tick box for value labels (coloured layers), an opacity slider,
+download button. Each layer has a tick, a **123** tick box for value
+labels (coloured layers), an opacity slider, its state (green dot: all
+hours ready; amber count: hours ready so far; grey name: not fetched),
 its own download button and (when on) its colour key. Above the groups:
-the Models and Parameters fetch menus, Fetch, and Clear data.
+the Models and Parameters fetch menus, Fetch, the store's size and
+Clear data.
+
+**Point values**: double-click the globe for every switched-on layer's
+value at that place (each model's own cell), in a panel that follows
+the time steps; close the panel to remove the marker.
+
+**Layout**: the layers switched on, opacities, value labels, model
+order, open groups, graticule, view and play speed are kept between
+runs (`globe_settings.json`); **Reset layout** restores the defaults.
 
 **Value labels**: the cells' own values (no interpolation), about 10 km
 apart, for the part of the globe in view. Zoomed out, the spacing widens
@@ -199,14 +224,16 @@ so no more than about 400 labels are drawn (the status bar says e.g.
 the view stops moving. Dry or see-through cells are not labelled.
 
 **Time bar** (bottom): first, back, play/pause, forward, last; the time
-slider; play speed; the valid time and each model's lead; Home view;
+slider, with a strip under it that is green where every switched-on
+layer is ready; play speed; the valid time and each model's lead; Home view;
 North up; how many layer-hours are ready, downloads in progress, and
 fetch messages. Play waits for a time that is not ready yet and stops at
 the last one. When the first model loads, the time nearest to now is
 shown.
 
 **Mouse**: drag to turn the globe (north stays up), scroll to zoom,
-Shift+drag to pan.
+Shift+drag to pan, double-click for point values. **?** (or F1) opens a
+short help.
 
 | Key | Action |
 |---|---|
@@ -216,6 +243,8 @@ Shift+drag to pan.
 | Space | Play / pause |
 | h | Home view: Ireland, north up |
 | n | North up from the current view |
+| g | Graticule on / off |
+| F1 | Help |
 
 ## Options
 
