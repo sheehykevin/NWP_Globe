@@ -354,7 +354,7 @@ def run_window(args):
         fetch_note.setToolTip(last[0])
     fetch_proc.readyRead.connect(fetch_output)
     fetch_proc.finished.connect(fetch_done)
-    fetch_menu.addAction("HARMONIE: latest KNMI run (about 6 GB "
+    fetch_menu.addAction("HARMONIE: latest KNMI run (about 3.4 GB "
                          "download)", lambda: fetch("harmonie"))
     fetch_menu.addAction("IBI waves: today 00Z to +72 h",
                          lambda: fetch("ibi"))

@@ -60,7 +60,7 @@ own last lead).
 | Model | Grid | From | Notes |
 |---|---|---|---|
 | UKV | 2 km Lambert equal area | UKMO NWP tools' archive | |
-| HARMONIE (KNMI) | P4a: rotated pole, 0.05 deg (about 5.5 km), Europe | KNMI Open Data API, control member of the latest run | Fetch menu; about 6 GB streamed per run, only the control member's fields kept |
+| HARMONIE (KNMI) | P3 (deterministic): rotated pole, 0.05 deg (about 5.5 km), Europe | KNMI Open Data API `harmonie_arome_cy43_p3`, latest run | Fetch menu; about 3.4 GB streamed per run, only the fields drawn are kept |
 | Global | 10 km lat/lon | archive, then the Met Office AWS bucket | downloads while a layer is on |
 | IBI waves | about 3 km lat/lon, 19W-5E, 26-56N | Copernicus Marine `IBI_ANALYSISFORECAST_WAV_005_005` | Fetch menu; significant wave height and mean wave direction (arrows point where the waves go) |
 
@@ -76,11 +76,11 @@ to true north; its hourly rain is the step in its run accumulation.
   `KNMI_API_KEY` environment variable or a `.env` file here with
   `KNMI_API_KEY=...` (git-ignored).
 - **Copernicus Marine**: run `copernicusmarine login` once.
-- The first HARMONIE fetch writes `docs\harmonie_inventory.md`, every
-  GRIB field in the control member. Taken: MSLP, 2 m temperature,
-  10 m wind, hourly-maximum gust, and precipitation (rain + snow +
-  graupel, accumulated from the run start; hourly amounts are the
-  steps). P4a has no CAPE. Leads T+0 to T+60, hourly.
+- Each HARMONIE fetch writes `docs\harmonie_inventory.md`, every GRIB
+  field in the run. Taken: MSLP, 2 m temperature, 10 m wind,
+  hourly-maximum gust, and total precipitation (field 61, accumulated
+  from the run start; hourly amounts are the steps). P3 has no CAPE.
+  Leads T+0 to T+60, hourly.
 
 ## Data
 

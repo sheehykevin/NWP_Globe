@@ -36,30 +36,29 @@ import xarray as xr
 import globe_data as data
 
 KNMI_API = "https://api.dataplatform.knmi.nl/open-data/v1"
-KNMI_DATASET = ("harmonie_arome_cy43_p4a", "1.0")
-CONTROL = re.compile(r"_meteo_000_(\d{12})_(\d{3})00_", re.I)
+# P3: deterministic, 0.05 deg rotated grid (DINI domain), 3.4 GB a run
+# (the P4a ensemble on the same grid is 5.85 GB).
+KNMI_DATASET = ("harmonie_arome_cy43_p3", "1.0")
+INNER = re.compile(r"_(\d{12})_(\d{3})00_GB", re.I)   # run, lead
 IBI_DATASET = "cmems_mod_ibi_wav_anfc_0.027deg_PT1H-i"
 IBI_PARAMS = {"VHM0": "sea_surface_wave_significant_height",
               "VMDR": "sea_surface_wave_from_direction"}
 
 # HARMONIE GRIB1 fields kept (KNMI local table 253), by
-# (indicatorOfParameter, indicatorOfTypeOfLevel, level), as found in a
-# P4a control file on 17 Nov 2026 (docs/harmonie_inventory.md lists all).
-# Rain, snow and graupel are accumulated from the run start (time range
-# 4, P1=0); gusts are the maximum over the past hour (time range 2).
-# P4a has no CAPE.
+# (indicatorOfParameter, indicatorOfTypeOfLevel, level,
+# timeRangeIndicator), as found in a P3 file on 18 Nov 2026
+# (docs/harmonie_inventory.md lists all). Total precipitation (61) is
+# accumulated from the run start (time range 4); gusts are the maximum
+# over the past hour (time range 2). P3 has no CAPE.
 HARMONIE_FIELDS = {
-    (1, 103, 0): "mslp",
-    (11, 105, 2): "t2m",
-    (33, 105, 10): "u10",
-    (34, 105, 10): "v10",
-    (162, 105, 10): "ugust",
-    (163, 105, 10): "vgust",
-    (181, 105, 0): "rain_acc",
-    (184, 105, 0): "snow_acc",
-    (201, 105, 0): "graupel_acc",
+    (1, 103, 0, 0): "mslp",
+    (11, 105, 2, 0): "t2m",
+    (33, 105, 10, 0): "u10",
+    (34, 105, 10, 0): "v10",
+    (162, 105, 10, 2): "ugust",
+    (163, 105, 10, 2): "vgust",
+    (61, 105, 0, 4): "tp_acc",
 }
-PRECIP_PARTS = ("rain_acc", "snow_acc", "graupel_acc")
 
 
 def _say(*args):
@@ -200,7 +199,7 @@ def fetch_harmonie(run=None):
     session = requests.Session()
     session.headers["Authorization"] = knmi_key()
     if run:
-        name = f"harm43_v1_P4a_{run}.tar"
+        name = f"HARM43_V1_P3_{run}.tar"
     else:
         listing = _knmi(session, "/files", maxKeys=5, orderBy="created",
                         sorting="desc")
@@ -212,8 +211,8 @@ def fetch_harmonie(run=None):
     run_time = datetime.strptime(re.search(r"(\d{10})", name).group(1),
                                  "%Y%m%d%H")
     url = _knmi(session, f"/files/{name}/url")["temporaryDownloadUrl"]
-    _say(f"HARMONIE {name}: streaming (about 6 GB); keeping the control "
-         "member only ...")
+    _say(f"HARMONIE {name}: streaming (about 3.4 GB); keeping the "
+         "fields the globe draws ...")
     inventory = {}
     acc_prev = {}
     grid = None
@@ -223,7 +222,7 @@ def fetch_harmonie(run=None):
         r.raw.decode_content = True
         with tarfile.open(fileobj=r.raw, mode="r|*") as tar:
             for member in tar:
-                m = CONTROL.search(member.name)
+                m = INNER.search(member.name)
                 if not (member.isfile() and m):
                     continue
                 lead = int(m.group(2))
@@ -237,9 +236,8 @@ def fetch_harmonie(run=None):
                         # names ("sfc") instead of the codes.
                         key = tuple(ec.codes_get_long(gid, k) for k in (
                             "indicatorOfParameter", "indicatorOfTypeOfLevel",
-                            "level"))
-                        tri = ec.codes_get_long(gid, "timeRangeIndicator")
-                        inventory.setdefault(key, set()).add(tri)
+                            "level", "timeRangeIndicator"))
+                        inventory.setdefault(key[:3], set()).add(key[3])
                         if key in HARMONIE_FIELDS:
                             if grid is None:
                                 grid = _grid_of(gid, ec)
@@ -256,7 +254,7 @@ def fetch_harmonie(run=None):
     _store_precip(run_time, acc_prev, grid)
     _write_inventory(name, inventory)
     if not seen:
-        raise SystemExit("No control-member files found in the archive")
+        raise SystemExit("No forecast files found in the archive")
     _prune("harmonie")
     _say("HARMONIE done:", f"{run_time:%Y%m%dT%H%MZ}")
 
@@ -285,11 +283,11 @@ def _store_harmonie(run, lead, f, grid, acc_prev):
             np.degrees(np.arctan2(-u, -v)) % 360.0, "degrees")
     if "ugust" in f and "vgust" in f:
         put("wind_gust_at_10m", np.hypot(f["ugust"], f["vgust"]), "m s-1")
-    if all(p in f for p in PRECIP_PARTS):
-        # Total precipitation (rain + snow + graupel, kg m-2 = mm) since
-        # the run start; hours arrive out of order, so the hourly steps
-        # are taken once the whole run is in (_store_precip).
-        acc_prev[lead] = sum(f[p] for p in PRECIP_PARTS).astype(np.float32)
+    if "tp_acc" in f:
+        # Total precipitation (kg m-2 = mm) since the run start; hours
+        # arrive out of order, so the hourly steps are taken once the
+        # whole run is in (_store_precip).
+        acc_prev[lead] = f["tp_acc"].astype(np.float32)
 
 
 def _store_precip(run, acc, grid):
@@ -324,13 +322,13 @@ def _to_true_north(u, v, x, y, attrs):
 
 def _write_inventory(name, inventory):
     path = os.path.join(data.HERE, "docs", "harmonie_inventory.md")
-    lines = [f"# HARMONIE P4a control member: GRIB1 fields in {name}", "",
+    lines = [f"# HARMONIE: GRIB1 fields in {name}", "",
              "| indicatorOfParameter | indicatorOfTypeOfLevel | level | "
              "timeRangeIndicator | used as |", "|---|---|---|---|---|"]
     for key in sorted(inventory):
         lines.append(f"| {key[0]} | {key[1]} | {key[2]} | "
                      f"{', '.join(map(str, sorted(inventory[key])))} | "
-                     f"{HARMONIE_FIELDS.get(key, '')} |")
+                     f"{', '.join(v for k, v in HARMONIE_FIELDS.items() if k[:3] == key)} |")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
