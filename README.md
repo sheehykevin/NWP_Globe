@@ -21,6 +21,10 @@ with those cells' own speed and direction, about 48 km apart.
 
 ## Install and run
 
+HARMONIE and the wave models need free accounts; the other models need
+nothing. See [docs/CREDENTIALS.md](docs/CREDENTIALS.md).
+
+
 ```
 conda env create -f environment.yml
 conda run -n ukmo_globe python globe.py
