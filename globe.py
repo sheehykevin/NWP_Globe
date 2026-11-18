@@ -1195,11 +1195,61 @@ def run_window(args):
                  ("Space", play_pause),
                  ("H", scene.go_home),
                  ("N", lambda: scene.north_up()),
-                 ("G", grid.toggle))
+                 ("G", grid.toggle),
+                 ("F1", lambda: show_help()))
     for keys, slot in shortcuts:
         sc = QtWidgets.QShortcut(keys, win)
         sc.setContext(QtCore.Qt.ApplicationShortcut)
         sc.activated.connect(slot)
+
+    KEY_HELP = {"Right": "next time", "Left": "previous time",
+                "Up": "six steps on", "Down": "six steps back",
+                "PgUp": "six steps on", "PgDown": "six steps back",
+                "Home": "first time", "End": "last time",
+                "Space": "play / pause", "H": "home view (Ireland)",
+                "N": "north up", "G": "graticule on / off",
+                "F1": "this help"}
+
+    def show_help():
+        keys = "".join(f"<tr><td><b>{k}</b></td><td>{KEY_HELP.get(k, '')}"
+                       "</td></tr>" for k, _ in shortcuts)
+        html = f'''
+<h3>NWP Globe</h3>
+<p><b>Mouse</b>: drag to turn the globe (north stays up), scroll to zoom,
+Shift+drag to pan, <b>double-click</b> a place for every shown layer's
+value there.</p>
+<p><b>Layers panel</b>: click a model's name (or the arrow) to open its
+layers; drag \u2630 to draw a model above the others; right-click a
+model for more (clear its data).</p>
+<table cellspacing=6>
+<tr><td style='color:#2e9e3e'>\u25cf</td><td>fetched: every hour ready</td></tr>
+<tr><td style='color:#c07a00'>12/31</td><td>partly fetched: hours ready of
+the run</td></tr>
+<tr><td style='color:#8a8a8a'>grey name</td><td>not fetched: tick it or press
+its download button</td></tr>
+<tr><td><span style='color:#fff;background:#2b6fd6'>&nbsp;18Z
+available&nbsp;</span></td><td>a newer run is published: click to fetch
+it</td></tr></table>
+<p><b>Download buttons</b>: a model's header button fetches every layer
+of its latest run (it turns into a stop button while fetching); a
+layer's button fetches that layer for every hour. The <b>Models</b> and
+<b>Parameters</b> menus with <b>Fetch</b> fetch several at once. Fetches
+can keep running after the window closes.</p>
+<p><b>Time bar</b>: the strip under the slider is green where every
+layer switched on is ready.</p>
+<p>Downloads are kept in <code>data\\store</code> until a newer run
+replaces them; <b>Clear data</b> deletes them all. The layout (layers,
+order, view) is kept between runs; <b>Reset layout</b> restores the
+defaults.</p>
+<h4>Keys</h4><table cellspacing=4>{keys}</table>'''
+        box = QtWidgets.QMessageBox(win)
+        box.setWindowTitle("Help")
+        box.setTextFormat(QtCore.Qt.RichText)
+        box.setText(html)
+        box.exec_()
+    help_act = bar.addAction("?")
+    help_act.setToolTip("Help: mouse, keys, what the panel shows (F1)")
+    help_act.triggered.connect(show_help)
 
     sync_slider()
     scene.start_workers()
