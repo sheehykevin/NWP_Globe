@@ -30,6 +30,31 @@ conda env create -f environment.yml
 conda run -n ukmo_globe python globe.py
 ```
 
+## Standalone build
+
+`build.bat` (in this folder) builds a standalone copy with PyInstaller
+into `dist\NWP_Globe` (about 1.5 GB, one folder). Copy that whole folder
+to another computer and run `NWP_Globe.exe`; no Python or conda is
+needed there. The build:
+
+1. creates the `ukmo_globe` conda environment if it is missing
+   (`build.bat /update` updates it from `environment.yml`);
+2. installs PyInstaller and pyflakes if missing (keeping pyvista 0.44.2
+   and VTK 9.3.1, which GeoVista 0.5.3 needs);
+3. makes sure GeoVista's background picture and coastlines are cached,
+   and bundles them (the built globe downloads nothing for its map);
+4. checks the code with pyflakes;
+5. builds `packaging\NWP_Globe.spec`;
+6. smoke-tests the two programs.
+
+The folder holds `NWP_Globe.exe` (the window) and `nwp-globe-fetch.exe`
+(a console program the window runs for HARMONIE and wave downloads, so
+it can report progress). Downloads, prepared layers and `.env` live
+next to the exe (`data`, `cache`); downloads are deleted on close as
+before. Close `NWP_Globe.exe` and anything open from `dist\NWP_Globe`
+before rebuilding. Wave models still need a Copernicus login on the
+target computer (see docs/CREDENTIALS.md).
+
 ## Layers
 
 Each weather model has these layers (those it has data for), with the
