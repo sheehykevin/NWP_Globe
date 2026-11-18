@@ -372,12 +372,67 @@ def run_window(args):
         threading.Thread(target=work, daemon=True).start()
     size_ready = threading.Event()
 
+    def explain(log):
+        """A plain-English cause for common failures, or ''."""
+        low = log.lower()
+        if "401" in low or "403" in low or "unauthorized" in low or \
+                "forbidden" in low:
+            return ("The server refused the request: check the API key "
+                    "(docs/CREDENTIALS.md).")
+        if "copernicus" in low and ("credential" in low or "login" in low
+                                    or "username" in low):
+            return ("Copernicus Marine needs a login on this computer: run "
+                    "'copernicusmarine login' (docs/CREDENTIALS.md).")
+        if any(s in low for s in ("getaddrinfo", "name or service",
+                                  "connectionerror", "urlopen error",
+                                  "timed out", "max retries")):
+            return ("Could not reach the server: check the internet "
+                    "connection, then try again.")
+        if "no space left" in low or "errno 28" in low:
+            return "The disk is full: free some space (or clear data)."
+        return ""
+
+    def show_log(model):
+        """The model's last fetch output, with a likely cause."""
+        try:
+            with open(jobs.job_paths(model)[0], encoding="utf-8",
+                      errors="replace") as f:
+                log = f.read()
+        except OSError:
+            log = "(no output was kept)"
+        lines = [s for s in log.splitlines()
+                 if not s.startswith("PROGRESS ")]
+        dlg = QtWidgets.QDialog(win)
+        dlg.setWindowTitle(f"{data.MODELS[model]['label']}: last fetch")
+        dlg.resize(760, 460)
+        v = QtWidgets.QVBoxLayout(dlg)
+        cause = explain(log)
+        if cause:
+            lab = QtWidgets.QLabel(cause)
+            lab.setWordWrap(True)
+            lab.setStyleSheet("font-weight:bold;color:#c0392b")
+            v.addWidget(lab)
+        txt = QtWidgets.QPlainTextEdit("\n".join(lines[-300:]))
+        txt.setReadOnly(True)
+        txt.setLineWrapMode(QtWidgets.QPlainTextEdit.WidgetWidth)
+        txt.moveCursor(QtGui.QTextCursor.End)
+        v.addWidget(txt, 1)
+        ok = QtWidgets.QPushButton("Close")
+        ok.clicked.connect(dlg.accept)
+        v.addWidget(ok, 0, QtCore.Qt.AlignRight)
+        dlg.exec_()
+
     def model_menu(model, where):
         menu = QtWidgets.QMenu(win)
+        log_act = menu.addAction("Show the last fetch's output")
+        log_act.setEnabled(os.path.exists(jobs.job_paths(model)[0]))
         act = menu.addAction("Clear this model's data")
         act.setEnabled(model not in running and not waiting[model]
                        and bool(sizes.get(model)))
-        if menu.exec_(where) is act:
+        chosen = menu.exec_(where)
+        if chosen is log_act:
+            show_log(model)
+        if chosen is act:
             if QtWidgets.QMessageBox.question(
                     win, "Clear model data",
                     f"Delete {data.MODELS[model]['label']}'s downloaded "
@@ -459,6 +514,7 @@ def run_window(args):
         note = QtWidgets.QLabel()
         note.setStyleSheet("color:#2b5fb4;font-size:8pt;margin-left:40px")
         note.setWordWrap(True)
+        note.linkActivated.connect(lambda _l, m=model: show_log(m))
         lay.addWidget(note)
         ui[model]["note"] = note
         body = QtWidgets.QWidget()
@@ -582,6 +638,10 @@ def run_window(args):
             w["badge"].setText(f"{newer[9:11]}Z available")
         w["badge"].setVisible(show)
         text = progress.get(model, "")
+        if text.startswith("fetch failed"):
+            import html
+            text = (f"<span style='color:#c0392b'>{html.escape(text)}</span>"
+                    " &nbsp;<a href='log'>details</a>")
         changed = w["note"].text() != text or w["note"].isVisible() != bool(
             text)
         w["note"].setText(text)
