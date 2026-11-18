@@ -36,6 +36,8 @@ MODELS = {
     "harmonie": dict(label="HARMONIE (KNMI)", dir="harmonie", prefix=None),
     # DWD open data, file by file (globe_icon.py).
     "icon": dict(label="ICON-EU (DWD)", dir="icon", prefix="dwd"),
+    # ECMWF open data 0.1 deg, field by field (globe_ecmwf.py).
+    "ecmwf": dict(label="ECMWF IFS 0.1", dir="ecmwf", prefix="ecmwf"),
     "global": dict(label="Global", dir="global10km",
                    prefix="global-deterministic-10km",
                    run_hours=range(0, 24, 6), last_lead=54),
@@ -52,17 +54,26 @@ def stamp(text):
     return datetime.strptime(text, "%Y%m%dT%H%MZ")
 
 
+# Models fetched field by field through a module of their own.
+FIELD_SOURCES = {"icon": "globe_icon", "ecmwf": "globe_ecmwf"}
+
+
+def field_source(model):
+    import importlib
+    return importlib.import_module(FIELD_SOURCES[model])
+
+
 def published_leads(model, parameter, run=None):
     """(lead, period) pairs a model publishes: Met Office hourly to
     T+54, Global then 3-hourly to T+69; ICON-EU per globe_icon.leads.
     Accumulations start at T+1 and (Global) switch from 1-hour to 3-hour
     periods after T+54."""
     acc = parameter in ACCUMULATED
-    if model == "icon":
-        import globe_icon
-        if parameter not in globe_icon.FIELDS:
+    if model in FIELD_SOURCES:
+        src = field_source(model)
+        if parameter not in src.FIELDS:
             return []
-        return globe_icon.leads(stamp(run).hour, acc)
+        return src.leads(stamp(run).hour, acc)
     out = [(h, 1 if acc else None) for h in range(1 if acc else 0, 55)]
     if model == "global":
         out += [(h, 3 if acc else None) for h in range(57, 70, 3)]
@@ -80,9 +91,8 @@ def file_name(run, parameter, valid, period=None):
 def latest_run(model, now=None, back_hours=48):
     """Newest run of a Met Office model whose last file is published
     (checked with an HTTPS HEAD request), or None."""
-    if model == "icon":
-        import globe_icon
-        return globe_icon.latest_run(now)
+    if model in FIELD_SOURCES:
+        return field_source(model).latest_run(now)
     m = MODELS[model]
     now = now or datetime.now(timezone.utc).replace(tzinfo=None)
     t = now.replace(minute=0, second=0, microsecond=0)
@@ -207,7 +217,7 @@ class Files:
                 self.inflight.pop(job).set()
 
     def _download(self, parameter, valid, period):
-        if self.model == "icon":
+        if self.model in FIELD_SOURCES:
             return self._download_icon(parameter, valid, period)
         name = file_name(self.run, parameter, valid, period)
         url = f"{BUCKET_URL}/{MODELS[self.model]['prefix']}/{self.run}/{name}"
@@ -251,8 +261,10 @@ class Files:
 
 
 def _download_icon(self, parameter, valid, period):
-    """Fetch the ICON-EU file(s) behind one of our files and write it."""
+    """Fetch the ICON-EU / ECMWF field(s) behind one of our files and
+    write it in our layout."""
     import globe_icon
+    src = field_source(self.model)
     with ACTIVE_LOCK:
         ACTIVE[0] += 1
     with self.lock:
@@ -262,8 +274,8 @@ def _download_icon(self, parameter, valid, period):
     try:
         if CLOSING.is_set():
             return None
-        got = globe_icon.make_field(self.run, parameter, valid, period,
-                                    self.icon_cache)
+        got = src.make_field(self.run, parameter, valid, period,
+                             self.icon_cache)
         if got is None or CLOSING.is_set():
             if got is None:
                 with self.lock:
@@ -273,7 +285,7 @@ def _download_icon(self, parameter, valid, period):
                             file_name(self.run, parameter, valid, period))
         globe_icon.write_netcdf(dest, parameter, *got)
     except (OSError, urllib.error.URLError, ValueError) as exc:
-        print("ICON-EU:", parameter, valid, exc)
+        print(MODELS[self.model]["label"] + ":", parameter, valid, exc)
         return None
     finally:
         with self.lock:

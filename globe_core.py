@@ -137,7 +137,7 @@ CLEAR = 255                         # class code: see-through
 PENDING = object()                  # cache marker: not prepared yet
 
 
-MODEL_ORDER = ["ukv", "harmonie", "icon", "global", "ibi"]
+MODEL_ORDER = ["ukv", "harmonie", "icon", "ecmwf", "global", "ibi"]
 WAVES = ("waves", "wave_dir")               # the IBI model's only layers
 
 
@@ -558,9 +558,12 @@ class LoadedModel:
         self.model, self.run = model, run
         self.files = data.Files(model, run, archive)
         self.grid = _make_grid(model, self.files, run, area)
+        hourly_rain = any(p == 1 for _, p in self.files.expected(RAIN))
         self.styles = [s for s in STYLES
                        if ((model == "ibi") == (s in WAVES))
-                       and all(self.files.expected(p) for p in needs(s))]
+                       and all(self.files.expected(p) for p in needs(s))
+                       # No 1-hour rain from 3-hourly accumulations.
+                       and (s != "rain_1h" or hourly_rain)]
 
 
 def _make_grid(model, files, run, area):
@@ -583,7 +586,7 @@ def _make_grid(model, files, run, area):
         return RotatedGrid(path)
     if model == "global":
         return GlobalGrid(path, AREAS[area])
-    if model == "icon":
+    if model in ("icon", "ecmwf"):
         return GlobalGrid(path, None, wrap=False)
     return GlobalGrid(path, None, wrap=False, km=ARROW_KM)
 

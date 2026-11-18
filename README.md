@@ -69,6 +69,7 @@ if it did not close cleanly.
 | UKV | 2 km Lambert equal area | Newest run (every 3 h) whose T+54 is published on the Met Office AWS bucket; files come as layers need them |
 | HARMONIE (KNMI) | P3 (deterministic): rotated pole, 0.05 deg (about 5.5 km), Europe | Newest P3 run on the KNMI Open Data API; about 3.4 GB streamed, only the fields drawn are kept (a few minutes to load) |
 | ICON-EU (DWD) | 0.0625 deg lat/lon (about 7 km), 23.5W-62.5E, 29.5-70.5N | Newest 00, 06, 12 or 18Z run (to T+120: hourly to T+78, then 3-hourly) whose T+120 is on opendata.dwd.de; the 03/09/15/21Z runs (to T+30 only) are not used; files (bz2 GRIB2, about 1 MB each) come as layers need them |
+| ECMWF IFS 0.1 | 0.1 deg lat/lon, North Atlantic and Europe block | ECMWF open data (data.ecmwf.int, `0p1/oper`), newest run whose last step is published: 00 and 12Z to T+120, 06 and 18Z to T+90, every 3 hours; only the fields a layer needs are fetched (HTTP range requests on each step's index) |
 | Global | 10 km lat/lon | Newest run (every 6 h) whose T+54 is published; files come as layers need them (about 6 MB per field per hour) |
 | IBI waves | about 3 km lat/lon, 19W-5E, 26-56N | Copernicus Marine `IBI_ANALYSISFORECAST_WAV_005_005`, today 00Z to +72 h; significant wave height and mean wave direction (arrows point where the waves go) |
 
@@ -76,6 +77,12 @@ ICON-EU has the same layers as UKV, with two notes: its CAPE is
 mixed-layer CAPE (ICON-EU publishes no most-unstable CAPE), and its
 rain over a period is the step in its run accumulation (`TOT_PREC`).
 Its winds are on a true lat/lon grid.
+
+ECMWF has the same layers as UKV except 1-hour rain: its steps are
+3-hourly, so rain windows are built from 3-hour steps of its run
+accumulation. Its gust is the maximum over the hour before each step to
+T+90 (`10fg`), then over the 3 hours before it (`10fg3`); its CAPE is
+most-unstable CAPE (`mucape`). Data: ECMWF open data, CC BY 4.0.
 
 HARMONIE winds are turned from the rotated grid to true north; its
 hourly rain is the step in its run accumulation (field 61). P3 has no
@@ -149,6 +156,7 @@ near-instant.
 | `globe_data.py` | Session folder, latest runs, downloading Met Office files |
 | `globe_pressure.py` | High/low centres, copied from the UKMO NWP tools |
 | `globe_icon.py` | ICON-EU (DWD): latest run, fetching and converting files |
+| `globe_ecmwf.py` | ECMWF IFS 0.1 deg open data: latest run, fetching fields |
 | `globe_fetch.py` | Fetching HARMONIE (KNMI) and IBI waves (Copernicus Marine) |
 | `globe.py` | The Qt window and the command line |
 
