@@ -138,8 +138,9 @@ PENDING = object()                  # cache marker: not prepared yet
 
 
 MODEL_ORDER = ["ukv", "harmonie", "icon", "ecmwf", "gfs_sflux",
-               "gfs_0p25", "global", "ibi"]
-WAVES = ("waves", "wave_dir")               # the IBI model's only layers
+               "gfs_0p25", "global", "nws", "ibi"]
+WAVES = ("waves", "wave_dir")               # wave models' only layers
+WAVE_MODELS = ("nws", "ibi")
 
 
 def needs(style):
@@ -561,7 +562,7 @@ class LoadedModel:
         self.grid = _make_grid(model, self.files, run, area)
         hourly_rain = any(p == 1 for _, p in self.files.expected(RAIN))
         self.styles = [s for s in STYLES
-                       if ((model == "ibi") == (s in WAVES))
+                       if ((model in WAVE_MODELS) == (s in WAVES))
                        and all(self.files.expected(p) for p in needs(s))
                        # No 1-hour rain from 3-hourly accumulations.
                        and (s != "rain_1h" or hourly_rain)]
@@ -569,6 +570,7 @@ class LoadedModel:
 
 def _make_grid(model, files, run, area):
     params = {"ibi": [STYLES["waves"]["param"]],
+              "nws": [STYLES["waves"]["param"]],
               "gfs_sflux": [WIND, RAIN]}.get(model, [MSLP, RAIN, WIND])
     path = None
     for param in params:

@@ -40,7 +40,14 @@ KNMI_API = "https://api.dataplatform.knmi.nl/open-data/v1"
 # (the P4a ensemble on the same grid is 5.85 GB).
 KNMI_DATASET = ("harmonie_arome_cy43_p3", "1.0")
 INNER = re.compile(r"_(\d{12})_(\d{3})00_GB", re.I)   # run, lead
-IBI_DATASET = "cmems_mod_ibi_wav_anfc_0.027deg_PT1H-i"
+# Copernicus Marine wave models: dataset and box (west, east, south,
+# north) fetched. Both give significant wave height and mean direction.
+WAVE_MODELS = {
+    "ibi": dict(label="IBI waves", box=(-19.5, 5.5, 25.5, 56.5),
+                dataset="cmems_mod_ibi_wav_anfc_0.027deg_PT1H-i"),
+    "nws": dict(label="NWS waves", box=(-16.5, 13.5, 45.5, 63.0),
+                dataset="cmems_mod_nws_wav_anfc_1.5km_PT1H-i"),
+}
 IBI_PARAMS = {"VHM0": "sea_surface_wave_significant_height",
               "VMDR": "sea_surface_wave_from_direction"}
 
@@ -86,24 +93,26 @@ def _write(model, run, param, valid, lead, values, coords, attrs,
 
 # ---- IBI waves ----------------------------------------------------------
 
-def fetch_ibi(hours=72, start=None):
-    """Today's 00Z onwards, ``hours`` long, whole IBI domain."""
+def fetch_waves(model="ibi", hours=72, start=None):
+    """Today's 00Z onwards, ``hours`` long, the model's whole domain."""
     import copernicusmarine
+    wm = WAVE_MODELS[model]
     start = start or datetime.now(timezone.utc).replace(
         hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
     end = start + timedelta(hours=hours)
-    tmp = os.path.join(data.DATA, "ibi", "_download")
+    tmp = os.path.join(data.DATA, model, "_download")
     shutil.rmtree(tmp, ignore_errors=True)
     os.makedirs(tmp)
-    _say(f"IBI waves {start:%Y-%m-%d %H}Z to {end:%Y-%m-%d %H}Z ...")
+    _say(f"{wm['label']} {start:%Y-%m-%d %H}Z to {end:%Y-%m-%d %H}Z ...")
+    west, east, south, north = wm["box"]
     copernicusmarine.subset(
-        dataset_id=IBI_DATASET, variables=list(IBI_PARAMS),
-        minimum_longitude=-19.5, maximum_longitude=5.5,
-        minimum_latitude=25.5, maximum_latitude=56.5,
+        dataset_id=wm["dataset"], variables=list(IBI_PARAMS),
+        minimum_longitude=west, maximum_longitude=east,
+        minimum_latitude=south, maximum_latitude=north,
         start_datetime=f"{start:%Y-%m-%dT%H:%M:%S}",
         end_datetime=f"{end:%Y-%m-%dT%H:%M:%S}",
-        output_directory=tmp, output_filename="ibi.nc")
-    with xr.open_dataset(os.path.join(tmp, "ibi.nc")) as ds:
+        output_directory=tmp, output_filename="waves.nc")
+    with xr.open_dataset(os.path.join(tmp, "waves.nc")) as ds:
         lat = ds["latitude"].values.astype(float)
         lon = ds["longitude"].values.astype(float)
         coords = {"latitude": ("y", lat), "longitude": ("x", lon),
@@ -115,12 +124,12 @@ def fetch_ibi(hours=72, start=None):
                 timezone.utc).replace(tzinfo=None)
             lead = int((valid - start) / timedelta(hours=1))
             for var, param in IBI_PARAMS.items():
-                _write("ibi", start, param, valid, lead,
+                _write(model, start, param, valid, lead,
                        ds[var].isel(time=k).values,
                        coords, {"units": ds[var].attrs.get("units", "")})
     shutil.rmtree(tmp, ignore_errors=True)
-    _prune("ibi")
-    _say("IBI done:", f"{start:%Y%m%dT%H%MZ}")
+    _prune(model)
+    _say(f"{wm['label']} done:", f"{start:%Y%m%dT%H%MZ}")
 
 
 def _edges_bounds(centres):
@@ -348,16 +357,17 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="what", required=True)
     h = sub.add_parser("harmonie")
     h.add_argument("--run", help="YYYYMMDDHH (default: newest listed)")
-    i = sub.add_parser("ibi")
-    i.add_argument("--hours", type=int, default=72)
-    i.add_argument("--start", help="YYYYMMDDHH (default: today 00Z)")
+    for name in WAVE_MODELS:
+        i = sub.add_parser(name)
+        i.add_argument("--hours", type=int, default=72)
+        i.add_argument("--start", help="YYYYMMDDHH (default: today 00Z)")
     args = ap.parse_args(argv)
     if args.what == "harmonie":
         fetch_harmonie(args.run)
     else:
         start = (datetime.strptime(args.start, "%Y%m%d%H")
                  if args.start else None)
-        fetch_ibi(args.hours, start)
+        fetch_waves(args.what, args.hours, start)
     return 0
 
 

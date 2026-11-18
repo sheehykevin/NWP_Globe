@@ -44,9 +44,10 @@ MODELS = {
                       prefix="noaa"),
     "gfs_0p25": dict(label="GFS 0.25 (NOAA)", dir="gfs_0p25",
                      prefix="noaa"),
-    "global": dict(label="Global", dir="global10km",
+    "global": dict(label="UKMO Global", dir="global10km",
                    prefix="global-deterministic-10km",
                    run_hours=range(0, 24, 6), last_lead=54),
+    "nws": dict(label="NWS waves (1.5 km)", dir="nws", prefix=None),
     "ibi": dict(label="IBI waves", dir="ibi", prefix=None),
 }
 # Parameters that are accumulations carry their period in the name.

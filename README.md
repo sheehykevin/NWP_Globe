@@ -72,7 +72,8 @@ if it did not close cleanly.
 | ECMWF IFS 0.1 | 0.1 deg lat/lon, North Atlantic and Europe block | ECMWF open data (data.ecmwf.int, `0p1/oper`), newest run whose last step is published: 00 and 12Z to T+120, 06 and 18Z to T+90, every 3 hours; only the fields a layer needs are fetched (HTTP range requests on each step's index) |
 | GFS sflux 13 km (NOAA) | T1534 Gaussian (about 13 km), North Atlantic and Europe block | NOAA GFS on AWS (`noaa-gfs-bdp-pds`), newest 00/06/12/18Z run with T+120 published; hourly to T+120; 2 m temperature, 10 m wind (speed, barbs) and rain, fetched by range requests on each step's `.idx` |
 | GFS 0.25 (NOAA) | 0.25 deg lat/lon, same block | Same run, 0.25 deg product: MSLP (isobars, centres), most-unstable CAPE (`CAPE:255-0 mb above ground`), gust (instantaneous: GFS has no hourly maximum gust) |
-| Global | 10 km lat/lon | Newest run (every 6 h) whose T+54 is published; files come as layers need them (about 6 MB per field per hour) |
+| UKMO Global | 10 km lat/lon | Newest run (every 6 h) whose T+54 is published; files come as layers need them (about 6 MB per field per hour) |
+| NWS waves (1.5 km) | about 1.5 km lat/lon, 16W-13E, 46-62.7N | Copernicus Marine `NWSHELF_ANALYSISFORECAST_WAV_004_014` (`cmems_mod_nws_wav_anfc_1.5km_PT1H-i`), today 00Z to +72 h; significant wave height and mean wave direction, as IBI |
 | IBI waves | about 3 km lat/lon, 19W-5E, 26-56N | Copernicus Marine `IBI_ANALYSISFORECAST_WAV_005_005`, today 00Z to +72 h; significant wave height and mean wave direction (arrows point where the waves go) |
 
 ICON-EU has the same layers as UKV, with two notes: its CAPE is

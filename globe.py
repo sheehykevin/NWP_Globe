@@ -309,7 +309,7 @@ def run_window(args):
         proc.readyRead.connect(output)
         proc.finished.connect(finished)
         procs[model] = proc
-        what = "harmonie" if model == "harmonie" else "ibi"
+        what = model                 # harmonie, ibi or nws
         proc.start(sys.executable, [
             os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "globe_fetch.py"), what])
