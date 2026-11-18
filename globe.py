@@ -670,10 +670,14 @@ def run_window(args):
         menu = QtWidgets.QMenu(btn)
         actions = {}
         for key, label in items:
-            act = menu.addAction(label)
-            act.setCheckable(True)
-            act.setChecked(checked)
-            actions[key] = act
+            # A tick box in the menu: the menu stays open while ticking.
+            box = QtWidgets.QCheckBox(label)
+            box.setChecked(checked)
+            box.setStyleSheet("padding:3px 10px")
+            wa = QtWidgets.QWidgetAction(menu)
+            wa.setDefaultWidget(box)
+            menu.addAction(wa)
+            actions[key] = box
         menu.addSeparator()
         menu.addAction("All", lambda: [a.setChecked(True)
                                        for a in actions.values()])
@@ -692,15 +696,40 @@ def run_window(args):
     go_fetch.setToolTip("Fetch the ticked parameters for every ticked model "
                         "that has them (latest run if none is stored)")
 
+    def label_params():
+        """Each parameter with how many of the ticked models have it."""
+        models = [m for m, a in model_acts.items() if a.isChecked()]
+        for s, box in param_acts.items():
+            n = sum(s in core.capable_styles(m) for m in models)
+            box.setText(f"{STYLES[s]['name']}  ({n} of {len(models)} "
+                        "models)")
+            box.setEnabled(n > 0)
+    params_btn.menu().aboutToShow.connect(label_params)
+
     def fetch_menus():
         layers = [s for s, a in param_acts.items() if a.isChecked()]
-        if not layers:
-            status_note.setText("  Tick parameters in the Parameters menu")
+        models = [m for m, a in model_acts.items() if a.isChecked()]
+        if not layers or not models:
+            status_note.setText("  Tick models and parameters in the menus "
+                                "first")
             return
-        for m, a in model_acts.items():
-            if a.isChecked():
-                fetch(m, [s for s in layers
-                          if s in core.capable_styles(m)])
+        skipped = []
+        for m in models:
+            have = core.capable_styles(m)
+            mine = [s for s in layers if s in have]
+            if mine:
+                fetch(m, mine)
+            missing = [STYLES[s]["name"] for s in layers if s not in have]
+            if missing:
+                skipped.append(f"{data.MODELS[m]['label']}: no "
+                               + ", ".join(missing))
+        if skipped:
+            status_note.setText(f"  Skipped (not published): "
+                                f"{len(skipped)} model(s), see tooltip")
+            status_note.setToolTip("\n".join(skipped))
+        else:
+            status_note.setText("")
+            status_note.setToolTip("")
     go_fetch.clicked.connect(fetch_menus)
     clear_btn = QtWidgets.QPushButton("Clear data")
     clear_btn.setToolTip("Delete all downloaded data (the window restarts)")
