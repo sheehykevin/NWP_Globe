@@ -159,14 +159,6 @@ def run_window(args):
     # At most MAX_JOBS at once: each has several workers and its own
     # drawing engine, and the servers ask for modest use.
     MAX_JOBS = max(1, int(os.environ.get("GLOBE_MAX_JOBS", "2")))
-    def job_command(model, layers, latest):
-        argv = ["--job", model, *layers] + (["--latest"] if latest else [])
-        if getattr(sys, "frozen", False):
-            return (os.path.join(os.path.dirname(sys.executable),
-                                 "nwp-globe-fetch.exe"), argv)
-        return sys.executable, [os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "globe.py"), *argv]
-
     def fetch(model, layers=None, latest=False):
         """Queue a job: ``layers`` of ``model`` (default: all)."""
         layers = [s for s in (layers or core.capable_styles(model))
@@ -195,83 +187,140 @@ def run_window(args):
         for m in panel_order:
             if waiting[m] and m not in running:
                 n += 1
-                progress[m] = "queued (next)" if n == 1 else                     f"queued ({n} in line)"
+                progress[m] = ("queued (next)" if n == 1
+                               else f"queued ({n} in line)")
+
+    def describe(layers):
+        return (", ".join(STYLES[s]["name"] for s in layers)
+                if len(layers) <= 2 else f"{len(layers)} layers")
+
+    def follow(model, pid, names):
+        """Follow a job running in the background (started here or
+        found running)."""
+        running[model] = dict(pid=pid, pos=0, names=names, last="")
+        progress[model] = f"fetching {names} ..."
 
     def start_next(model):
         if not waiting[model]:
             return
         layers, latest = waiting[model].pop(0)
-        proc = QtCore.QProcess(win)
-        proc.setProcessChannelMode(QtCore.QProcess.MergedChannels)
-        last = [""]
-        names = ", ".join(STYLES[s]["name"] for s in layers) \
-            if len(layers) <= 2 else f"{len(layers)} layers"
-        progress[model] = f"fetching {names} ..."
+        follow(model, jobs.start_job(model, layers, latest),
+               describe(layers))
 
-        def output():
-            text = bytes(proc.readAll()).decode("utf-8", "replace")
-            for line in text.splitlines():
-                line = line.strip()
-                if line.startswith("PROGRESS "):
-                    _, _, d, w = line.split()
-                    progress[model] = f"fetching {names}: {d}/{w}"
-                elif line.startswith("DONE "):
-                    last[0] = "DONE"
-                elif line.startswith("NOTE "):
-                    progress[model] = line.split(" ", 2)[2]
-                elif line.startswith("FAILED "):
-                    last[0] = line.split(" ", 2)[2]
-                elif line:
-                    progress[model] = (f"fetching {names}: "
-                                       f"{line[:60]}")
+    def read_job(model):
+        """Take in a job's new log lines; True when the job has ended."""
+        job = running[model]
+        alive = jobs.pid_alive(job["pid"])
+        try:
+            with open(jobs.job_paths(model)[0], encoding="utf-8",
+                      errors="replace") as f:
+                f.seek(job["pos"])
+                text = f.read()
+                job["pos"] = f.tell()
+        except OSError:
+            text = ""
+        names = job["names"]
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("PROGRESS "):
+                d, w = line.split()[2:4]
+                progress[model] = f"fetching {names}: {d}/{w}"
+            elif line.startswith("DONE "):
+                job["last"] = "DONE"
+            elif line.startswith("NOTE "):
+                progress[model] = line.split(" ", 2)[2]
+            elif line.startswith("FAILED "):
+                job["last"] = line.split(" ", 2)[2]
+            elif line and not line.startswith(("Traceback", "File ")):
+                progress[model] = f"fetching {names}: {line[:60]}"
+        return not alive
 
-        def finished(code, _status):
-            running.pop(model, None)
-            was_stopped = model in stopped
-            stopped.discard(model)
-            if was_stopped and jobs.stored_run(model) is None:
-                progress[model] = "stopped"
-            elif was_stopped or last[0] == "DONE":   # load what is there
-                progress[model] = ("stopped; " if was_stopped else "") +                     "loading ..."
-                run = jobs.stored_run(model)
+    def finished(model):
+        job = running.pop(model)
+        was_stopped = model in stopped
+        stopped.discard(model)
+        if was_stopped and jobs.stored_run(model) is None:
+            progress[model] = "stopped"
+        elif was_stopped or job["last"] == "DONE":   # load what is there
+            progress[model] = (("stopped; " if was_stopped else "")
+                               + "loading ...")
+            run = jobs.stored_run(model)
 
-                def work():
-                    try:
-                        done.put((model, core.load_model(model, run=run,
-                                                         area=args.area)))
-                    except Exception as exc:
-                        done.put((model, exc))
-                threading.Thread(target=work, daemon=True).start()
-            else:
-                progress[model] = ("fetch failed: " + (last[0] or
-                                   f"exit code {code}"))[:120]
-            pump()
-            build_items()
-        proc.readyRead.connect(output)
-        proc.finished.connect(finished)
-        running[model] = proc
-        prog, argv = job_command(model, layers, latest)
-        proc.start(prog, argv)
+            def work():
+                try:
+                    done.put((model, core.load_model(model, run=run,
+                                                     area=args.area)))
+                except Exception as exc:
+                    done.put((model, exc))
+            threading.Thread(target=work, daemon=True).start()
+        else:
+            progress[model] = ("fetch failed: " + (
+                job["last"] or "it ended without finishing"))[:120]
+        pump()
+        build_items()
+
+    adopt_tick = [0]
+
+    def poll_jobs():
+        for model in list(running):
+            if read_job(model):
+                read_job(model)                  # anything written last
+                finished(model)
+        # Jobs started elsewhere (a queue left by a closed window), every
+        # few seconds.
+        adopt_tick[0] += 1
+        if adopt_tick[0] % 6 == 1:
+            for model in data.MODELS:
+                if model not in running:
+                    pid = jobs.job_pid(model)
+                    if pid:
+                        follow(model, pid, "(started earlier)")
 
     stopped = set()
 
     def stop_fetch(model):
         """Cancel a model's queued and running fetch."""
         waiting[model].clear()
-        proc = running.get(model)
-        if proc is not None:
+        job = running.get(model)
+        if job is not None:
             stopped.add(model)
-            proc.kill()
+            jobs.kill(job["pid"])
         else:
             progress.pop(model, None)
         pump()
         build_items()
 
     def stop_jobs():
-        for proc in list(running.values()):
-            proc.kill()
-            proc.waitForFinished(3000)
-    app.aboutToQuit.connect(stop_jobs)
+        for m in list(running):
+            jobs.kill(running[m]["pid"])
+            waiting[m].clear()
+
+    def close_event(ev):
+        queued = [(m, *waiting[m][0]) for m in panel_order if waiting[m]]
+        if not running and not queued:
+            ev.accept()
+            return
+        box = QtWidgets.QMessageBox(win)
+        box.setWindowTitle("Fetches are running")
+        box.setText(f"{len(running)} fetch(es) running, {len(queued)} "
+                    "queued.\nKeep them going in the background? The "
+                    "results are there when the globe opens again.")
+        keep = box.addButton("Keep fetching",
+                             QtWidgets.QMessageBox.AcceptRole)
+        stop = box.addButton("Stop them",
+                             QtWidgets.QMessageBox.DestructiveRole)
+        box.addButton(QtWidgets.QMessageBox.Cancel)
+        box.exec_()
+        if box.clickedButton() is keep:
+            if queued:
+                jobs.start_queue(queued)
+            ev.accept()
+        elif box.clickedButton() is stop:
+            stop_jobs()
+            ev.accept()
+        else:
+            ev.ignore()
+    win.closeEvent = close_event
 
     # ---- layer panel: one group per model, drag to reorder ----
     def layer_state(model):
@@ -650,6 +699,7 @@ def run_window(args):
     shown_progress = [None]
 
     def poll():
+        poll_jobs()
         # A model finished loading?
         while not done.empty():
             model, result = done.get()
@@ -730,6 +780,7 @@ def run_window(args):
             scene.refresh()
             win.grab().save(args.smoke)
             print("wrote", args.smoke)
+            stop_jobs()
             app.quit()
         QtCore.QTimer.singleShot(args.smoke_wait * 1000, grab)
     code = app.exec_()
@@ -798,6 +849,12 @@ def main():
                     "all) into the store; used by the window")
     ap.add_argument("--latest", action="store_true",
                     help="with --job: the latest published run")
+    ap.add_argument("--log", action="store_true",
+                    help="with --job: output to data/store/jobs/MODEL.log "
+                    "(used by the window)")
+    ap.add_argument("--run-queue", action="store_true",
+                    help="run the fetches left queued when the window "
+                    "closed (used by the window)")
     ap.add_argument("--prefetch", nargs="*", metavar="MODEL",
                     help="latest run of these models (default: all), every "
                     "layer or those given with --layers, into the store")
@@ -809,8 +866,11 @@ def main():
     args = ap.parse_args()
     if args.job:
         import globe_jobs
-        return globe_jobs.run_job(args.job[0], args.job[1:] or None,
-                                  latest=args.latest)
+        run = globe_jobs.run_logged if args.log else globe_jobs.run_job
+        return run(args.job[0], args.job[1:] or None, latest=args.latest)
+    if args.run_queue:
+        import globe_jobs
+        return globe_jobs.run_queue()
     if args.prefetch is not None:
         import globe_jobs
         return globe_jobs.prefetch(args.prefetch or None, args.layers)

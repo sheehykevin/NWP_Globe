@@ -174,3 +174,160 @@ def prefetch(models=None, layers=None):
     _say(f"Pre-download complete in {(time.time() - t0) / 60:.0f} min"
          + (f" ({failed} model(s) failed)" if failed else ""))
     return 1 if failed else 0
+
+
+# ---- jobs as background processes (the window starts and follows them) ----
+# Each job writes its output to data/store/jobs/<model>.log and its process
+# id to <model>.pid while it runs, so it can outlive the window and a new
+# window can pick it up.
+
+def jobs_dir():
+    return os.path.join(data.DATA, "jobs")
+
+
+def job_paths(model):
+    d = jobs_dir()
+    return os.path.join(d, f"{model}.log"), os.path.join(d, f"{model}.pid")
+
+
+def pid_alive(pid):
+    """Is process ``pid`` still running (Windows and others)?"""
+    if not pid:
+        return False
+    if os.name == "nt":
+        import ctypes
+        k = ctypes.windll.kernel32
+        h = k.OpenProcess(0x1000, False, int(pid))   # query limited info
+        if not h:
+            return False
+        code = ctypes.c_ulong()
+        ok = k.GetExitCodeProcess(h, ctypes.byref(code))
+        k.CloseHandle(h)
+        return bool(ok) and code.value == 259         # STILL_ACTIVE
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except OSError:
+        return False
+
+
+def kill(pid):
+    """End process ``pid`` (TerminateProcess on Windows)."""
+    import signal
+    try:
+        os.kill(int(pid), signal.SIGTERM)
+    except (OSError, ValueError):
+        pass
+
+
+def job_pid(model):
+    """Process id of the model's running job, or None."""
+    try:
+        with open(job_paths(model)[1]) as f:
+            pid = int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        return None
+    return pid if pid_alive(pid) else None
+
+
+def _command(argv):
+    """The program and arguments that run ``globe.py argv`` (built: the
+    console program next to the exe)."""
+    import sys
+    if getattr(sys, "frozen", False):
+        return [os.path.join(os.path.dirname(sys.executable),
+                             "nwp-globe-fetch.exe"), *argv]
+    return [sys.executable, os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "globe.py"), *argv]
+
+
+def _spawn(argv):
+    """Start a process that survives the window, with no console."""
+    import subprocess
+    flags = 0
+    if os.name == "nt":
+        flags = (subprocess.DETACHED_PROCESS
+                 | subprocess.CREATE_NEW_PROCESS_GROUP
+                 | subprocess.CREATE_NO_WINDOW)
+    kw = dict(cwd=os.path.dirname(os.path.dirname(data.DATA)),
+              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+              stderr=subprocess.DEVNULL, close_fds=True)
+    if os.name == "nt":
+        # Leave the launcher's Windows job object (conda run, terminals)
+        # so closing it does not end the fetch; refused where not allowed.
+        try:
+            return subprocess.Popen(_command(argv), creationflags=flags
+                                    | 0x01000000, **kw).pid
+        except OSError:
+            pass
+    return subprocess.Popen(_command(argv), creationflags=flags, **kw).pid
+
+
+def start_job(model, layers, latest=False):
+    """Start a job in the background; returns its process id."""
+    log, _ = job_paths(model)
+    os.makedirs(jobs_dir(), exist_ok=True)
+    try:
+        os.remove(log)                  # the window reads it from the start
+    except OSError:
+        pass
+    return _spawn(["--job", model, *layers,
+                   *(["--latest"] if latest else []), "--log"])
+
+
+def run_logged(model, layers=None, latest=False):
+    """run_job with its output in the model's log, and a process-id file
+    while it runs."""
+    import sys
+    import traceback
+    log, pidfile = job_paths(model)
+    os.makedirs(jobs_dir(), exist_ok=True)
+    with open(pidfile, "w") as f:
+        f.write(str(os.getpid()))
+    out = open(log, "a", encoding="utf-8", buffering=1)
+    saved = sys.stdout, sys.stderr
+    sys.stdout = sys.stderr = out
+    try:
+        return run_job(model, layers, latest)
+    except BaseException as exc:
+        traceback.print_exc()
+        _say(f"FAILED {model} {exc}")
+        return 1
+    finally:
+        sys.stdout, sys.stderr = saved
+        out.close()
+        try:
+            os.remove(pidfile)
+        except OSError:
+            pass
+
+
+def queue_path():
+    return os.path.join(jobs_dir(), "queue.json")
+
+
+def start_queue(items):
+    """Run queued jobs [(model, layers, latest), ...] one after another
+    in one background process (used when the window closes)."""
+    import json
+    os.makedirs(jobs_dir(), exist_ok=True)
+    with open(queue_path(), "w", encoding="utf-8") as f:
+        json.dump([list(i) for i in items], f)
+    return _spawn(["--run-queue"])
+
+
+def run_queue():
+    import json
+    try:
+        with open(queue_path(), encoding="utf-8") as f:
+            items = json.load(f)
+        os.remove(queue_path())
+    except (OSError, ValueError):
+        return 0
+    failed = 0
+    for model, layers, latest in items:
+        if job_pid(model):              # already being fetched
+            continue
+        data.CLOSING.clear()
+        failed += run_logged(model, layers, latest) or 0
+    return 1 if failed else 0
