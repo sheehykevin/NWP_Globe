@@ -137,7 +137,7 @@ CLEAR = 255                         # class code: see-through
 PENDING = object()                  # cache marker: not prepared yet
 
 
-MODEL_ORDER = ["ukv", "harmonie", "global", "ibi"]
+MODEL_ORDER = ["ukv", "harmonie", "icon", "global", "ibi"]
 WAVES = ("waves", "wave_dir")               # the IBI model's only layers
 
 
@@ -583,6 +583,8 @@ def _make_grid(model, files, run, area):
         return RotatedGrid(path)
     if model == "global":
         return GlobalGrid(path, AREAS[area])
+    if model == "icon":
+        return GlobalGrid(path, None, wrap=False)
     return GlobalGrid(path, None, wrap=False, km=ARROW_KM)
 
 

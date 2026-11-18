@@ -68,8 +68,14 @@ if it did not close cleanly.
 |---|---|---|
 | UKV | 2 km Lambert equal area | Newest run (every 3 h) whose T+54 is published on the Met Office AWS bucket; files come as layers need them |
 | HARMONIE (KNMI) | P3 (deterministic): rotated pole, 0.05 deg (about 5.5 km), Europe | Newest P3 run on the KNMI Open Data API; about 3.4 GB streamed, only the fields drawn are kept (a few minutes to load) |
+| ICON-EU (DWD) | 0.0625 deg lat/lon (about 7 km), 23.5W-62.5E, 29.5-70.5N | Newest run (every 3 h; 00/06/12/18Z to T+120, the others to T+30) whose last file is on opendata.dwd.de; files (bz2 GRIB2, about 1 MB each) come as layers need them |
 | Global | 10 km lat/lon | Newest run (every 6 h) whose T+54 is published; files come as layers need them (about 6 MB per field per hour) |
 | IBI waves | about 3 km lat/lon, 19W-5E, 26-56N | Copernicus Marine `IBI_ANALYSISFORECAST_WAV_005_005`, today 00Z to +72 h; significant wave height and mean wave direction (arrows point where the waves go) |
+
+ICON-EU has the same layers as UKV, with two notes: its CAPE is
+mixed-layer CAPE (ICON-EU publishes no most-unstable CAPE), and its
+rain over a period is the step in its run accumulation (`TOT_PREC`).
+Its winds are on a true lat/lon grid.
 
 HARMONIE winds are turned from the rotated grid to true north; its
 hourly rain is the step in its run accumulation (field 61). P3 has no
@@ -142,6 +148,7 @@ near-instant.
 | `globe_core.py` | Layers, rain sums, drawing and background preparation; no window code |
 | `globe_data.py` | Session folder, latest runs, downloading Met Office files |
 | `globe_pressure.py` | High/low centres, copied from the UKMO NWP tools |
+| `globe_icon.py` | ICON-EU (DWD): latest run, fetching and converting files |
 | `globe_fetch.py` | Fetching HARMONIE (KNMI) and IBI waves (Copernicus Marine) |
 | `globe.py` | The Qt window and the command line |
 

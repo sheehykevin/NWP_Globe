@@ -34,6 +34,8 @@ MODELS = {
     "ukv": dict(label="UKV", dir="ukv", prefix="uk-deterministic-2km",
                 run_hours=range(0, 24, 3), last_lead=54),
     "harmonie": dict(label="HARMONIE (KNMI)", dir="harmonie", prefix=None),
+    # DWD open data, file by file (globe_icon.py).
+    "icon": dict(label="ICON-EU (DWD)", dir="icon", prefix="dwd"),
     "global": dict(label="Global", dir="global10km",
                    prefix="global-deterministic-10km",
                    run_hours=range(0, 24, 6), last_lead=54),
@@ -50,11 +52,17 @@ def stamp(text):
     return datetime.strptime(text, "%Y%m%dT%H%MZ")
 
 
-def published_leads(model, parameter):
-    """(lead, period) pairs a Met Office model publishes: hourly to
-    T+54; Global then 3-hourly to T+69. Accumulations start at T+1 and
-    (Global) switch from 1-hour to 3-hour periods after T+54."""
+def published_leads(model, parameter, run=None):
+    """(lead, period) pairs a model publishes: Met Office hourly to
+    T+54, Global then 3-hourly to T+69; ICON-EU per globe_icon.leads.
+    Accumulations start at T+1 and (Global) switch from 1-hour to 3-hour
+    periods after T+54."""
     acc = parameter in ACCUMULATED
+    if model == "icon":
+        import globe_icon
+        if parameter not in globe_icon.FIELDS:
+            return []
+        return globe_icon.leads(stamp(run).hour, acc)
     out = [(h, 1 if acc else None) for h in range(1 if acc else 0, 55)]
     if model == "global":
         out += [(h, 3 if acc else None) for h in range(57, 70, 3)]
@@ -72,6 +80,9 @@ def file_name(run, parameter, valid, period=None):
 def latest_run(model, now=None, back_hours=48):
     """Newest run of a Met Office model whose last file is published
     (checked with an HTTPS HEAD request), or None."""
+    if model == "icon":
+        import globe_icon
+        return globe_icon.latest_run(now)
     m = MODELS[model]
     now = now or datetime.now(timezone.utc).replace(tzinfo=None)
     t = now.replace(minute=0, second=0, microsecond=0)
@@ -136,6 +147,7 @@ class Files:
         self.found = {}          # parameter -> {(valid, period): path}
         self.missing = set()     # (parameter, valid, period) not published
         self.inflight = {}       # (parameter, valid, period) -> Event
+        self.icon_cache = {}     # ICON raw fields, a few at a time
         self.downloads = 0
 
     def _scan(self, parameter):
@@ -162,8 +174,8 @@ class Files:
         if self.can_download:
             start = stamp(self.run)
             keys |= {(start + timedelta(hours=lead), period)
-                     for lead, period in published_leads(self.model,
-                                                         parameter)}
+                     for lead, period in published_leads(
+                         self.model, parameter, self.run)}
         return keys
 
     def path(self, parameter, valid, period=None, fetch=True):
@@ -195,6 +207,8 @@ class Files:
                 self.inflight.pop(job).set()
 
     def _download(self, parameter, valid, period):
+        if self.model == "icon":
+            return self._download_icon(parameter, valid, period)
         name = file_name(self.run, parameter, valid, period)
         url = f"{BUCKET_URL}/{MODELS[self.model]['prefix']}/{self.run}/{name}"
         folder = os.path.join(self.dirs[0], parameter)
@@ -234,6 +248,44 @@ class Files:
         with self.lock:
             self.found.setdefault(parameter, {})[(valid, period)] = dest
         return dest
+
+
+def _download_icon(self, parameter, valid, period):
+    """Fetch the ICON-EU file(s) behind one of our files and write it."""
+    import globe_icon
+    with ACTIVE_LOCK:
+        ACTIVE[0] += 1
+    with self.lock:
+        self.downloads += 1
+        if len(self.icon_cache) > 24:           # keep memory bounded
+            self.icon_cache.clear()
+    try:
+        if CLOSING.is_set():
+            return None
+        got = globe_icon.make_field(self.run, parameter, valid, period,
+                                    self.icon_cache)
+        if got is None or CLOSING.is_set():
+            if got is None:
+                with self.lock:
+                    self.missing.add((parameter, valid, period))
+            return None
+        dest = os.path.join(self.dirs[0], parameter,
+                            file_name(self.run, parameter, valid, period))
+        globe_icon.write_netcdf(dest, parameter, *got)
+    except (OSError, urllib.error.URLError, ValueError) as exc:
+        print("ICON-EU:", parameter, valid, exc)
+        return None
+    finally:
+        with self.lock:
+            self.downloads -= 1
+        with ACTIVE_LOCK:
+            ACTIVE[0] -= 1
+    with self.lock:
+        self.found.setdefault(parameter, {})[(valid, period)] = dest
+    return dest
+
+
+Files._download_icon = _download_icon
 
 
 def _remove(path):
