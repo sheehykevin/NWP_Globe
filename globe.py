@@ -18,6 +18,7 @@ End first/last time, h home view (Ireland, north up), n north up.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 import globe_core as core
@@ -98,6 +99,24 @@ def download_icon(QtGui, QtCore, size=18):
     p.drawLine(s // 2, int(s * 0.7), s // 2 + 4, int(s * 0.7) - 4)
     p.end()
     return QtGui.QIcon(pix)
+
+
+def restart_args(argv=None, frozen=None):
+    """Arguments to start this window again: the built program gets only
+    its options (sys.argv[0] is the exe itself), Python gets the script
+    first. --load is dropped so a restart fetches nothing."""
+    argv = list(sys.argv if argv is None else argv)
+    frozen = getattr(sys, "frozen", False) if frozen is None else frozen
+    out, skip = [], False
+    for a in argv[1:]:
+        if a == "--load":
+            skip = True
+            continue
+        if skip and not a.startswith("--"):
+            continue
+        skip = False
+        out.append(a)
+    return out if frozen else [os.path.abspath(argv[0])] + out
 
 
 def run_window(args):
@@ -261,6 +280,9 @@ def run_window(args):
             data.MODELS[model]["label"] + (f"  {scene.runs[model]}"
                                            if loaded else "  (no data)"))
         title.setFlat(True)
+        last = data.last_event(model)
+        title.setToolTip("Open / fold this model's layers"
+                         + (f"\nLast store change: {last}" if last else ""))
         title.setStyleSheet("font-weight:bold;text-align:left;padding:0")
         get = QtWidgets.QToolButton()
         get.setIcon(icon)
@@ -456,7 +478,9 @@ def run_window(args):
         import shutil
         data.clear_session(wait=5.0)
         shutil.rmtree(core.STORE_CACHE, ignore_errors=True)
-        QtCore.QProcess.startDetached(sys.executable, sys.argv)
+        data.log_event("clear", detail="Clear data pressed")
+        QtCore.QProcess.startDetached(sys.executable, restart_args(),
+                                      core.HERE)
         app.quit()
     clear_btn.clicked.connect(clear_store)
     fetch_row = QtWidgets.QHBoxLayout()

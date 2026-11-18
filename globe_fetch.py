@@ -131,7 +131,6 @@ def fetch_waves(model="ibi", hours=72, start=None):
                        ds[var].isel(time=k).values,
                        coords, {"units": ds[var].attrs.get("units", "")})
     shutil.rmtree(tmp, ignore_errors=True)
-    _prune(model)
     _say(f"{wm['label']} done:", f"{start:%Y%m%dT%H%MZ}")
 
 
@@ -366,7 +365,6 @@ def fetch_harmonie(run=None, params=None):
             _say(f"  T+{lead}: {', '.join(sorted(fields)) or 'none'}")
     _store_precip(run_time, acc_prev, grid)
     _write_inventory(name, inventory)
-    _prune("harmonie")
     _say(f"HARMONIE done: {run_time:%Y%m%dT%H%MZ} "
          f"({got[0] / 1e6:.0f} MB fetched of {total / 1e9:.1f} GB)")
 
@@ -445,14 +443,6 @@ def _write_inventory(name, inventory):
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
     _say("Inventory written:", path)
-
-
-def _prune(model, keep=2):
-    root = os.path.join(data.DATA, data.MODELS[model]["dir"])
-    runs = sorted(r for r in os.listdir(root)
-                  if re.fullmatch(r"\d{8}T\d{4}Z", r))
-    for r in runs[:-keep]:
-        shutil.rmtree(os.path.join(root, r), ignore_errors=True)
 
 
 def main(argv=None):

@@ -150,10 +150,45 @@ ACTIVE = [0]                       # downloads in progress
 ACTIVE_LOCK = threading.Lock()
 
 
+def log_path():
+    return os.path.join(DATA, "log.txt")
+
+
+def log_event(action, model="", run="", detail=""):
+    """One line in the store's log (data/store/log.txt): every deletion
+    and anything else worth explaining later. Several processes write;
+    a failed write is retried briefly, then given up."""
+    import time
+    line = (f"{datetime.now(timezone.utc):%Y-%m-%dT%H:%M:%SZ}  {action:<10}"
+            f"  {model:<14} {run:<15} {detail}\n")
+    path = log_path()
+    for _ in range(5):
+        try:
+            os.makedirs(DATA, exist_ok=True)
+            if os.path.exists(path) and os.path.getsize(path) > 1_000_000:
+                os.replace(path, path[:-4] + ".old.txt")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line)
+            return
+        except OSError:
+            time.sleep(0.1)
+
+
+def last_event(model):
+    """The newest log line about ``model``, or ''."""
+    try:
+        with open(log_path(), encoding="utf-8") as f:
+            lines = [s.rstrip() for s in f if f"  {model} " in s]
+    except OSError:
+        return ""
+    return lines[-1] if lines else ""
+
+
 def drop_old_runs(model, keep):
     """Delete a model's runs in the store other than ``keep``."""
     for run in held_runs(model):
         if run != keep:
+            log_event("drop-run", model, run, f"newer run {keep} kept")
             shutil.rmtree(os.path.join(DATA, MODELS[model]["dir"], run),
                           ignore_errors=True)
 
@@ -163,20 +198,37 @@ def migrate():
     into the store, once."""
     old = os.path.join(HERE, "data", "prefetched")
     if os.path.isdir(old):
-        for model in MODELS:
-            src = os.path.join(old, MODELS[model]["dir"])
-            if not os.path.isdir(src):
-                continue
-            for run in os.listdir(src):
-                dst = os.path.join(DATA, MODELS[model]["dir"], run)
-                if not os.path.exists(dst):
-                    os.makedirs(os.path.dirname(dst), exist_ok=True)
-                    try:
-                        os.replace(os.path.join(src, run), dst)
-                    except OSError:
-                        pass
-        shutil.rmtree(old, ignore_errors=True)
+        left = merge_tree(old, DATA)
+        if left:
+            log_event("migrate", detail=f"{left} file(s) could not be moved "
+                      f"from {old}; tried again at the next start")
     shutil.rmtree(os.path.join(HERE, "data", "session"), ignore_errors=True)
+
+
+def merge_tree(src, dst):
+    """Move every file under ``src`` to the same place under ``dst``
+    (files already there are kept, the duplicate in ``src`` removed),
+    then remove the folders of ``src`` that became empty. Nothing that
+    failed to move is deleted. Returns how many files were left."""
+    left = 0
+    for root, dirs, files in os.walk(src, topdown=False):
+        rel = os.path.relpath(root, src)
+        target = os.path.normpath(os.path.join(dst, rel))
+        for f in files:
+            a, b = os.path.join(root, f), os.path.join(target, f)
+            try:
+                if os.path.exists(b):
+                    os.remove(a)
+                else:
+                    os.makedirs(target, exist_ok=True)
+                    os.replace(a, b)
+            except OSError:
+                left += 1
+        try:
+            os.rmdir(root)                      # only if empty
+        except OSError:
+            pass
+    return left
 
 
 def clear_session(wait=0.0):
@@ -192,8 +244,9 @@ def clear_session(wait=0.0):
     for _ in range(5):
         shutil.rmtree(DATA, ignore_errors=True)
         if not os.path.exists(DATA):
-            return
+            break
         time.sleep(0.3)
+    log_event("cleared", detail="the whole store was deleted")
 
 
 class Files:

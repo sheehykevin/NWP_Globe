@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import glob
 import os
+import re
 import shutil
 import time
 
@@ -44,26 +45,28 @@ def migrate_cache():
     import globe_core as core
     old = os.path.join(core.CACHE, "prefetched")
     if os.path.isdir(old):
-        os.makedirs(core.STORE_CACHE, exist_ok=True)
-        for name in os.listdir(old):
-            try:
-                os.replace(os.path.join(old, name),
-                           os.path.join(core.STORE_CACHE, name))
-            except OSError:
-                pass
-        shutil.rmtree(old, ignore_errors=True)
+        left = data.merge_tree(old, core.STORE_CACHE)
+        if left:
+            data.log_event("migrate", detail=f"{left} prepared file(s) could "
+                           f"not be moved from {old}")
     shutil.rmtree(os.path.join(core.CACHE, "session"), ignore_errors=True)
 
 
 def drop_old_cache(model, keep):
     """Delete a model's prepared layers of runs other than ``keep``."""
     import globe_core as core
+    gone = set()
     for path in glob.glob(os.path.join(core.STORE_CACHE, f"{model}_*.npz")):
-        if f"_{keep}_" not in os.path.basename(path):
+        name = os.path.basename(path)
+        if f"_{keep}_" not in name:
             try:
                 os.remove(path)
+                gone |= set(re.findall(r"_(\d{8}T\d{4}Z)_", name)[:1])
             except OSError:
                 pass
+    for run in sorted(gone):
+        data.log_event("drop-cache", model, run,
+                       f"prepared layers; newer run {keep} kept")
 
 
 def run_job(model, layers=None, latest=False):
