@@ -889,7 +889,7 @@ class Scene:
         self.graticule = []
         if on:
             self.graticule = [self.pl.add_mesh(
-                _dashed_graticule(), color="white", line_width=1,
+                _dashed_graticule(), color="white", line_width=1, opacity=0.6,
                 render=False)]
         if render:
             self.pl.render()
