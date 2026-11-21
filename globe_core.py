@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import threading
 import warnings
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 
 import contourpy
@@ -136,6 +137,42 @@ warnings.filterwarnings("ignore", message="geovista found no coordinate")
 READ_LOCK = threading.Lock()
 CLEAR = 255                         # class code: see-through
 PENDING = object()                  # cache marker: not prepared yet
+# Prepared items kept in memory (MB); older ones are read again from
+# their saved files when shown.
+MEMORY_MB = float(os.environ.get("GLOBE_MEMORY_MB", "1500"))
+RAIN_KEEP = 240                     # rain fields kept for summing (LRU)
+# GLOBE_PROFILE=1 prints how long drawing calls take.
+PROFILE = os.environ.get("GLOBE_PROFILE", "") not in ("", "0")
+
+
+def _profiled(fn):
+    """Print the call's time when GLOBE_PROFILE is set."""
+    if not PROFILE:
+        return fn
+    import functools
+    import time
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        t0 = time.perf_counter()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            print(f"[profile] {fn.__name__}: "
+                  f"{1000 * (time.perf_counter() - t0):.1f} ms", flush=True)
+    return wrapper
+
+
+def _zscale(z):
+    """Radius factor of a GeoVista zlevel (steps of 1/10000 of the
+    radius): the same height add_mesh(zlevel=z) gives, set on the actor
+    so the mesh is never rebuilt to move it."""
+    return 1.0 + z * 1e-4
+
+
+def _place(actor, z):
+    s = _zscale(z)
+    actor.SetScale(s, s, s)
 
 
 MODEL_ORDER = ["ukv", "arome_001", "arome_0025", "aromeifs_0025",
@@ -238,11 +275,13 @@ def classes(values, levels, clear_below=None):
     return out.ravel()
 
 
+_SHOWN = np.arange(256, dtype=np.float32)
+_SHOWN[CLEAR] = np.nan
+
+
 def shown(cls):
     """Class bytes -> what the mesh draws; CLEAR becomes NaN."""
-    out = cls.astype(np.float32)
-    out[cls == CLEAR] = np.nan
-    return out
+    return _SHOWN[cls]
 
 
 def xyz(lon, lat):
@@ -581,6 +620,15 @@ def _save_item(path, value):
     os.replace(tmp, path)
 
 
+def _item_bytes(value):
+    """Memory a prepared item takes (about)."""
+    if isinstance(value, np.ndarray):
+        return value.nbytes
+    mesh, (pts, txt) = value
+    return (mesh.points.nbytes + mesh.lines.nbytes
+            + (0 if pts is None else np.asarray(pts).nbytes) + 32 * len(txt))
+
+
 def _load_item(path):
     with np.load(path) as f:
         if "raster" in f:
@@ -706,13 +754,19 @@ class Scene:
         self.visible, self.opacity, self.model_on = {}, {}, {}
         self.label_on = {}
         self.rasters = {}                       # lid -> drawn mesh actor
-        self.lines = {}
+        self.raster_shown = {}                  # lid -> item drawn in it
+        self.lines = {}                         # lid -> its actors
+        self.line_parts = {}                    # lid -> what they show
         self.value_actors = {}
+        self.label_key = None                   # what the labels show
+        self.generation = 0                     # bumped when models change
         self.label_note = ""
         self.cache = {}                         # (lid, t) -> item or None
+        self.in_memory = OrderedDict()          # (lid, t) -> bytes, LRU
+        self.memory = 0
         self.claimed = set()
         self.failures = {}
-        self.rain = {}                          # (model, end, period)
+        self.rain = OrderedDict()               # (model, end, period), LRU
         self.centres_xyz = {}                   # model -> cell centres
         self.cell_size = {}                     # model -> neighbour angle
         self.lock = threading.Lock()
@@ -733,6 +787,17 @@ class Scene:
         if hasattr(pl, "_warn_opacity"):
             pl._warn_opacity = lambda: None
         pl.set_background("#0b1020")
+        # See-through layers are stacked in the order _sort_layers sets
+        # (bottom first). VTK's default when depth peeling is off is
+        # order-independent translucency, which averages overlapping
+        # see-through layers instead: a model dragged on top, or rain
+        # over a sea mask, would come out as a mix. A plain render-steps
+        # pass blends in actor order (and costs no extra passes).
+        try:
+            from vtkmodules.vtkRenderingOpenGL2 import vtkRenderStepsPass
+            pl.renderer.SetPass(vtkRenderStepsPass())
+        except ImportError:
+            pass
         texture = gv.natural_earth_1() if base == "colour" else grey_texture()
         pl.add_base_layer(texture=texture, zlevel=0)
         # Heights (GeoVista zlevel steps of 1/10000 of the radius, about
@@ -763,10 +828,11 @@ class Scene:
         with self.lock:
             # A model loaded again (after a fetch): forget what was
             # prepared from its earlier files.
+            self.generation += 1
             if m in self.runs:
                 for key in [k for k in self.cache
                             if split_id(k[0])[0] == m]:
-                    del self.cache[key]
+                    self._forget(key)
                 for key in [k for k in self.rain if k[0] == m]:
                     del self.rain[key]
                 self.centres_xyz.clear()
@@ -814,8 +880,11 @@ class Scene:
         if m not in self.models:
             return
         with self.lock:
+            self.generation += 1
             lids = [lid for lid in self.layers if split_id(lid)[0] == m]
             for lid in lids:
+                self.raster_shown.pop(lid, None)
+                self.line_parts.pop(lid, None)
                 actor = self.rasters.pop(lid, None)
                 for a in ([actor] if actor is not None else []) + \
                         self.lines.pop(lid, []) + \
@@ -826,7 +895,7 @@ class Scene:
                           self.raster_z, self.z_plan):
                     d.pop(lid, None)
             for key in [k for k in self.cache if split_id(k[0])[0] == m]:
-                del self.cache[key]
+                self._forget(key)
             for key in [k for k in self.failures
                         if split_id(k[0])[0] == m]:
                 del self.failures[key]
@@ -850,8 +919,7 @@ class Scene:
 
     def go_home(self):
         self.pl.camera_position = self.home
-        self.pl.render()
-        self.update_labels()
+        self.update_labels()                 # renders
 
     def north_up(self, render=True):
         cam = self.pl.camera
@@ -864,6 +932,7 @@ class Scene:
     def is_on(self, lid):
         return self.visible[lid] and self.model_on[split_id(lid)[0]]
 
+    @_profiled
     def set_visible(self, lid, on, render=True):
         self.visible[lid] = bool(on)
         self.wake.set()
@@ -915,38 +984,40 @@ class Scene:
         return 1.0 + (self.z_top + 10) * 1e-4
 
     def _place_coastlines(self):
-        z = self.z_top + 1
-        if self.coast is not None and getattr(self, "coast_z", None) == z:
-            return
-        if self.coast is not None:
-            self.pl.remove_actor(self.coast, render=False)
-        self.coast = self.pl.add_coastlines(color="black", line_width=2,
-                                            zlevel=z)
-        self.coast_z = z
+        """Coastlines just above the coloured layers: read once, then
+        moved by scaling the actor."""
+        if self.coast is None:
+            self.coast = self.pl.add_coastlines(color="black", line_width=2,
+                                                zlevel=0)
+        _place(self.coast, self.z_top + 1)
 
     def set_graticule(self, on, render=True):
         """Lines every 10 degrees, just above the base map and under every
-        model layer (rasters start at height 2)."""
-        for actor in self.graticule:
-            self.pl.remove_actor(actor, render=False)
-        self.graticule = []
-        if on:
+        model layer (rasters start at height 2). Made once, then only
+        shown or hidden."""
+        if on and not self.graticule:
             self.graticule = [self.pl.add_mesh(
                 _dashed_graticule(), color="white", line_width=1, opacity=0.6,
                 render=False)]
+        for actor in self.graticule:
+            actor.SetVisibility(bool(on))
         if render:
             self.pl.render()
 
     def _add_raster(self, lid, mesh):
         style = STYLES[split_id(lid)[1]]
         n = len(style["colours"])
-        actor = self.pl.add_mesh(mesh, zlevel=self._z(lid), scalars="value",
+        # Added on the unit globe; its height is the actor's scale.
+        actor = self.pl.add_mesh(mesh, zlevel=0, scalars="value",
                                  cmap=style["colours"],
                                  clim=(-0.5, n - 0.5), n_colors=n,
-                                 nan_opacity=0.0, show_scalar_bar=False)
+                                 nan_opacity=0.0, show_scalar_bar=False,
+                                 render=False)
         _set_opacity(actor, self.opacity[lid])
         self.rasters[lid] = actor
+        self.raster_shown[lid] = None
         self.raster_z[lid] = self._z(lid)
+        _place(actor, self.raster_z[lid])
         return actor
 
     def set_order(self, order, render=True):
@@ -960,6 +1031,7 @@ class Scene:
     def time(self):
         return self.times[self.i] if self.times else None
 
+    @_profiled
     def go(self, i, render=True):
         if not self.times:
             return
@@ -1021,12 +1093,16 @@ class Scene:
             if job[1] == self.time:
                 self.dirty = True
 
-    def prepare(self, lid, t):
-        """One layer at one time, from disk if saved, else computed."""
+    def saved_path(self, lid, t):
+        """Where a prepared item is saved."""
         model = split_id(lid)[0]
         name = (f"{lid.replace(':', '_')}_{self.runs[model]}_"
                 f"{t:%Y%m%dT%H%MZ}.npz")
-        saved = os.path.join(self.disk, name)
+        return os.path.join(self.disk, name)
+
+    def prepare(self, lid, t):
+        """One layer at one time, from disk if saved, else computed."""
+        saved = self.saved_path(lid, t)
         try:
             value = _load_item(saved)
         except (OSError, KeyError, ValueError):
@@ -1037,10 +1113,55 @@ class Scene:
                 except OSError as exc:
                     print("Could not save", saved, exc)
         with self.lock:
-            # Pre-downloading keeps only the saved files, not every item
-            # in memory: True marks the item as done.
-            self.cache[(lid, t)] = value if self.keep_in_memory else True
+            self._remember((lid, t), value)
         return value
+
+    def _load_shown(self, lid, t):
+        """An item for the shown time that was prepared earlier but is
+        not in memory (dropped to save memory, or saved by a fetch job):
+        read at once from its saved file, so the time shows without
+        waiting for the workers. PENDING if it is not saved."""
+        saved = self.saved_path(lid, t)
+        try:
+            value = _load_item(saved)
+        except (OSError, KeyError, ValueError):
+            return PENDING
+        with self.lock:
+            self._remember((lid, t), value)
+        return value
+
+    def _remember(self, key, value):
+        """Keep a prepared item (lock held). Pre-downloading keeps only
+        the saved files: True marks the item as done. In memory, the
+        least recently used items beyond MEMORY_MB are dropped to True
+        and read from their saved files when wanted again."""
+        self._forget(key)
+        if not self.keep_in_memory:
+            self.cache[key] = True
+            return
+        if value is None:
+            self.cache[key] = None
+            return
+        self.cache[key] = value
+        size = _item_bytes(value)
+        self.in_memory[key] = size
+        self.memory += size
+        limit = MEMORY_MB * 1e6
+        while self.memory > limit and len(self.in_memory) > 1:
+            old, n = self.in_memory.popitem(last=False)
+            self.memory -= n
+            if old in self.cache:
+                self.cache[old] = True
+
+    def _forget(self, key):
+        """Drop an item from the cache (lock held)."""
+        self.cache.pop(key, None)
+        self.memory -= self.in_memory.pop(key, 0)
+
+    def _touch(self, key):
+        """Mark an item as just used (lock held)."""
+        if key in self.in_memory:
+            self.in_memory.move_to_end(key)
 
     def _field(self, model, param, t, scale=1.0, offset=0.0):
         path = self.files[model].path(param, t)
@@ -1052,12 +1173,15 @@ class Scene:
         key = (model, end, period)
         with self.lock:
             if key in self.rain:
+                self.rain.move_to_end(key)
                 return self.rain[key]
         path = self.files[model].path(RAIN, end, period)
         value = None if path is None else self.grids[model].cut(
             read_field(path, 1000.0))
         with self.lock:
             self.rain[key] = value
+            while len(self.rain) > RAIN_KEEP:
+                self.rain.popitem(last=False)
         return value
 
     def rain_total(self, model, t, hours):
@@ -1219,15 +1343,28 @@ class Scene:
     def update_labels(self, render=True):
         """Label raw cell values of layers with labels on, for the part
         of the globe in view: cells about 10 km apart, or wider when that
-        would mean more than MAX_LABELS labels."""
+        would mean more than MAX_LABELS labels. Nothing is redone when
+        the time, layers, view and data are as last time."""
         pl, t = self.pl, self.time
+        wanted = [lid for lid in self.layers
+                  if self.label_on.get(lid) and self.is_on(lid)
+                  and STYLES[split_id(lid)[1]]["kind"] == "raster"]
+        with self.lock:
+            # The items drawn, so labels follow a layer becoming ready.
+            items = tuple(id(self.cache.get((lid, t))) for lid in wanted)
+        key = (t, tuple(wanted), items, self.generation,
+               self.label_radius(),
+               tuple(round(v, 5) for v in pl.camera.position)
+               if wanted else None)
+        if key == self.label_key:
+            if render:
+                pl.render()
+            return
+        self.label_key = key
         for lid, actors in self.value_actors.items():
             for actor in actors:
                 pl.remove_actor(actor, render=False)
             actors.clear()
-        wanted = [lid for lid in self.layers
-                  if self.label_on.get(lid) and self.is_on(lid)
-                  and STYLES[split_id(lid)[1]]["kind"] == "raster"]
         self.label_note = ""
         if not wanted or t is None:
             if render:
@@ -1283,81 +1420,155 @@ class Scene:
             self.dirty = False
             self.show()
 
+    @_profiled
     def show(self, render=True, block=False):
+        """Bring every layer's drawing up to the shown time and switches.
+        Actors are kept and reused: a raster's cells are rewritten only
+        when its item changed, line layers are rebuilt only when their
+        item changed, and heights change by scaling the actors."""
         if not getattr(self, "drawing", True):
             return
         pl, t = self.pl, self.time
         self._plan_heights()
         self._place_coastlines()
-        # Rasters whose height changed are re-added at the new height.
-        for lid, actor in list(self.rasters.items()):
-            if lid in self.z_plan and self.raster_z.get(lid) != \
-                    self.z_plan[lid]:
-                mesh = actor.mapper.dataset
-                pl.remove_actor(actor, render=False)
-                self._add_raster(lid, mesh)
+        for lid, actor in self.rasters.items():
+            if lid in self.z_plan and self.raster_z.get(lid) !=                     self.z_plan[lid]:
+                self.raster_z[lid] = self.z_plan[lid]
+                _place(actor, self.z_plan[lid])
         lift = self.label_radius()
         for lid in list(self.layers):
             model, name = split_id(lid)
             style = STYLES[name]
             on = self.is_on(lid)
-            with self.lock:
-                value = self.cache.get((lid, t), PENDING)
-            if value is True:                # pre-download marker only
-                value = PENDING
-            if on and value is PENDING and block:
-                value = self.prepare(lid, t)
+            value = PENDING
+            if on:
+                with self.lock:
+                    value = self.cache.get((lid, t), PENDING)
+                    self._touch((lid, t))
+                if value is True or value is PENDING:
+                    # Prepared but not in memory (or saved by a fetch
+                    # job): read it now rather than wait for a worker.
+                    value = self._load_shown(lid, t)
+                if value is PENDING and block:
+                    value = self.prepare(lid, t)
             if style["kind"] == "raster":
-                actor = self.rasters.get(lid)
-                if actor is None and on:
-                    actor = self._add_raster(lid, self.grids[model].mesh())
-                if actor is None:
-                    continue
-                mesh = actor.mapper.dataset
-                if on and isinstance(value, np.ndarray):
-                    mesh.cell_data["value"] = shown(value)
-                else:
-                    mesh.cell_data["value"][:] = np.nan
-                    mesh.Modified()
-                actor.SetVisibility(on)
-                continue
-            for actor in self.lines[lid]:
-                pl.remove_actor(actor, render=False)
-            self.lines[lid] = []
-            if not on or value is PENDING or value is None:
-                continue
-            mesh, (pts, labels) = value
-            if mesh.n_points:
-                actor = pl.add_mesh(
-                    mesh.mesh(), color=style["colour"], zlevel=self._z(lid),
-                    line_width=1.5 if style["kind"] == "isobars" else 1.2)
-                _lines_on_top(actor)
-                self.lines[lid].append(actor)
-            if pts is not None and style["kind"] == "centres":
-                for letter, colour in CENTRE_COLOURS.items():
-                    keep = [k for k, s in enumerate(labels)
-                            if s.startswith(letter)]
-                    if keep:
-                        self.lines[lid].append(pl.add_point_labels(
-                            _lift(np.asarray(pts)[keep], lift),
-                            [labels[k].replace(" ", "\n") for k in keep],
-                            font_size=15, bold=True, text_color=colour,
-                            shape=None, show_points=False,
-                            always_visible=False, justification_horizontal=
-                            "center", render=False))
-            elif pts is not None:
-                self.lines[lid].append(pl.add_point_labels(
-                    _lift(pts, lift), labels, font_size=11,
-                    text_color=style["colour"],
-                    shape=None, show_points=False, always_visible=False,
-                    render=False))
-            for actor in self.lines[lid]:
-                _set_opacity(actor, self.opacity[lid])
+                self._show_raster(lid, on, value)
+            else:
+                self._show_lines(lid, on, value, lift)
+        self._sort_layers()
         pl.add_text(self.caption(), position="upper_left", font_size=10,
-                    color="white", name="title")
+                    color="white", name="title", render=False)
         self.update_labels(render=False)
         if render:
             pl.render()
+
+    def _sort_layers(self):
+        """Draw the see-through layers bottom first. VTK blends
+        see-through actors in the order they are in the renderer and
+        does not let their heights decide (they do not write depth), so
+        the order is set to the planned heights: model rasters, then
+        line layers. Moving an actor in the list rebuilds nothing."""
+        stack = [(self.z_plan[lid], a) for lid, a in self.rasters.items()
+                 if lid in self.z_plan]
+        # Lines above everything coloured (they may be see-through too).
+        stack += [(self._z(lid), a) for lid, p in self.line_parts.items()
+                  if self.is_on(lid) for a in p["meshes"]]
+        order = [a for _, a in sorted(stack, key=lambda p: p[0])]
+        if order == getattr(self, "_drawn_order", None):
+            return
+        ren = self.pl.renderer
+        for actor in order:                    # to the end, in order
+            ren.RemoveActor(actor)
+            ren.AddActor(actor)
+        self._drawn_order = order
+
+    def _show_raster(self, lid, on, value):
+        actor = self.rasters.get(lid)
+        if actor is None:
+            if not on:
+                return
+            actor = self._add_raster(lid, self.grids[split_id(lid)[0]].mesh())
+        if on:
+            item = value if isinstance(value, np.ndarray) else None
+            if self.raster_shown.get(lid) is not item:
+                mesh = actor.mapper.dataset
+                if item is not None:
+                    mesh.cell_data["value"] = shown(item)
+                else:                         # not ready: see-through
+                    mesh.cell_data["value"][:] = np.nan
+                    mesh.Modified()
+                self.raster_shown[lid] = item
+        # Hidden layers keep their cells: switching back on is instant.
+        actor.SetVisibility(on)
+
+    def _show_lines(self, lid, on, value, lift):
+        """Isobars, barbs, arrows and centres: (re)built only when the
+        item changed; hidden, not removed, when switched off."""
+        pl = self.pl
+        part = self.line_parts.get(lid)
+        if not on:
+            for actor in self.lines[lid]:
+                actor.SetVisibility(False)
+            return
+        if value is PENDING or value is None:
+            for actor in self.lines[lid]:
+                pl.remove_actor(actor, render=False)
+            self.lines[lid] = []
+            self.line_parts.pop(lid, None)
+            return
+        style = STYLES[split_id(lid)[1]]
+        z = self._z(lid)
+        if part is None or part["value"] is not value:
+            for actor in self.lines[lid]:
+                pl.remove_actor(actor, render=False)
+            meshes = []
+            mesh = value[0]
+            if mesh.n_points:
+                actor = pl.add_mesh(
+                    mesh.mesh(), color=style["colour"], zlevel=0,
+                    line_width=1.5 if style["kind"] == "isobars" else 1.2,
+                    render=False)
+                _lines_on_top(actor)
+                meshes.append(actor)
+            part = dict(value=value, meshes=meshes, labels=[], lift=None)
+            self.line_parts[lid] = part
+        for actor in part["meshes"]:
+            _place(actor, z)
+        if part["lift"] != lift:
+            for actor in part["labels"]:
+                pl.remove_actor(actor, render=False)
+            part["labels"] = self._line_labels(style, value[1], lift)
+            part["lift"] = lift
+        self.lines[lid] = part["meshes"] + part["labels"]
+        for actor in self.lines[lid]:
+            _set_opacity(actor, self.opacity[lid])
+            actor.SetVisibility(True)
+
+    def _line_labels(self, style, labelled, lift):
+        """Text of a line layer: isobar values, or H/L centres."""
+        pts, labels = labelled
+        pl, out = self.pl, []
+        if pts is None:
+            return out
+        if style["kind"] == "centres":
+            for letter, colour in CENTRE_COLOURS.items():
+                keep = [k for k, s in enumerate(labels)
+                        if s.startswith(letter)]
+                if keep:
+                    out.append(pl.add_point_labels(
+                        _lift(np.asarray(pts)[keep], lift),
+                        [labels[k].replace(" ", "\n") for k in keep],
+                        font_size=15, bold=True, text_color=colour,
+                        shape=None, show_points=False,
+                        always_visible=False, justification_horizontal=
+                        "center", render=False))
+        else:
+            out.append(pl.add_point_labels(
+                _lift(pts, lift), labels, font_size=11,
+                text_color=style["colour"],
+                shape=None, show_points=False, always_visible=False,
+                render=False))
+        return out
 
     def leads_text(self):
         t, out = self.time, []

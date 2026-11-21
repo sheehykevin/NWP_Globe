@@ -349,25 +349,24 @@ class Files:
             self.downloads += 1
         with ACTIVE_LOCK:
             ACTIVE[0] += 1
+        import requests
         try:
-            with urllib.request.urlopen(url, timeout=60) as r, \
-                    open(part, "wb") as f:
-                while not CLOSING.is_set():      # stop at once on close
-                    chunk = r.read(1 << 20)
-                    if not chunk:
-                        break
-                    f.write(chunk)
+            with _session().get(url, timeout=60, stream=True) as r:
+                if r.status_code in (403, 404):   # not published
+                    with self.lock:
+                        self.missing.add((parameter, valid, period))
+                    return None
+                r.raise_for_status()
+                with open(part, "wb") as f:
+                    for chunk in r.iter_content(1 << 20):
+                        if CLOSING.is_set():      # stop at once on close
+                            break
+                        f.write(chunk)
             if CLOSING.is_set():
                 _remove(part)
                 return None
             os.replace(part, dest)
-        except urllib.error.HTTPError as exc:
-            if exc.code in (403, 404):            # not published
-                with self.lock:
-                    self.missing.add((parameter, valid, period))
-            _remove(part)
-            return None
-        except (OSError, urllib.error.URLError):
+        except (OSError, requests.RequestException):
             _remove(part)
             return None
         finally:
@@ -378,6 +377,20 @@ class Files:
         with self.lock:
             self.found.setdefault(parameter, {})[(valid, period)] = dest
         return dest
+
+
+_SESSIONS = threading.local()
+
+
+def _session():
+    """This thread's HTTP session: the connection to the bucket stays
+    open between files (about three times faster than a new connection
+    per file, which is mostly TLS set-up)."""
+    s = getattr(_SESSIONS, "s", None)
+    if s is None:
+        import requests
+        s = _SESSIONS.s = requests.Session()
+    return s
 
 
 def _download_icon(self, parameter, valid, period):

@@ -271,7 +271,18 @@ harmonie|ibi` fetches from the command line.
 ## Speed
 
 Layers fetched are prepared for every hour and saved, so stepping
-through them is near-instant.
+through them is near-instant. Drawings are kept and reused: ticking a
+layer on or off only shows or hides it, a time step rewrites only the
+layers whose picture changed, and layers move up or down (when others
+are switched on or reordered) by scaling, without being rebuilt.
+Prepared hours are kept in memory up to `GLOBE_MEMORY_MB` (default
+1500); older ones are read back from their saved files when shown.
+`GLOBE_PROFILE=1` prints how long each redraw takes. UKV and Global
+files are downloaded over kept-open connections (about three times
+faster per file than a new connection each).
+
+See-through layers are drawn bottom first in the panel's order (the
+top model's colours over the lower model's), not mixed together.
 
 ## Files
 
