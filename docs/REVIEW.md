@@ -64,8 +64,8 @@ then the rest as wanted.
 fixed: GRIB decoding is not thread-safe, so every decoder now holds one
 lock (`globe_paths.GRIB_LOCK`). C1–C7 are not started.
 
-**Since the review (21 Nov 2026)**: speed work and a layer-order bug
-(D1–D4 below), measured off screen with UKV, HARMONIE and Global loaded
+**Since the review (21 Nov 2026)**: speed work and map overlays
+(D1–D5 below), measured off screen with UKV, HARMONIE and Global loaded
 and 12 layers on.
 
 | ID | Change | Before | After |
@@ -74,9 +74,10 @@ and 12 layers on.
 | D2 | Shown time read at once from saved files; prepared items kept in memory up to `GLOBE_MEMORY_MB` (LRU), rain fields capped (`RAIN_KEEP`) | step to an hour not in memory: blank until a worker loaded it | drawn at once (~120 ms for 12 layers) |
 | D3 | UKV / Global downloads over a kept-open `requests.Session` per thread (`globe_data._session`) | ~520 ms per file | ~170 ms per file |
 | D4 | **Bug**: see-through layers were blended by VTK's order-independent translucency (its default without depth peeling), so overlapping models were averaged, not stacked, and dragging a model on top had little effect. Now a plain `vtkRenderStepsPass` with the actors sorted by planned height (`Scene._sort_layers`) | top model's colours washed into the one below | top model drawn over the lower one |
+| D5 | Map overlays: hillshade, sea mask, boundary lines (`globe_overlays.py`, `tools/prepare_overlays.py`, panel section, saved with the layout, `--overlays` for screenshots) | – | see README, Map overlays |
 
 `GLOBE_PROFILE=1` prints redraw times. Frame time while dragging was
-already small (about 7 ms with three rasters and four line layers),
+already small (about 11 ms with everything on, including all overlays),
 so navigation itself was left alone. `GLOBE_MAX_JOBS` stays at 2 (the
 servers ask for modest use).
 

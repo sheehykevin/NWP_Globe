@@ -806,6 +806,8 @@ class Scene:
         # sideways towards the edge of the view (parallax).
         self.raster_z = {}                      # lid -> height drawn at
         self.z_plan, self.z_top = {}, 2
+        self.overlays = {}                      # name -> its state
+        self.overlay_z = {}                     # picture name -> height
         self.coast = None
         self._place_coastlines()
         self.graticule = []                     # its actors
@@ -968,8 +970,13 @@ class Scene:
             rank = len(self.order) - 1 - self.order.index(model)
             return rank, RASTERS.index(style)
         on.sort(key=bottom_first)
-        self.z_plan = {lid: 2 + 2 * k for k, lid in enumerate(on)}
-        self.z_top = 2 + 2 * len(on)
+        # Overlay pictures (hillshade, sea) lowest, on the base map.
+        pics = [n for n, o in self.overlays.items()
+                if o["on"] and o["ov"].kind == "image"]
+        self.overlay_z = {n: 2 + 2 * k for k, n in enumerate(pics)}
+        bottom = 2 + 2 * len(pics)
+        self.z_plan = {lid: bottom + 2 * k for k, lid in enumerate(on)}
+        self.z_top = bottom + 2 * len(on)
 
     def _z(self, lid):
         """Height of a layer (see _plan_heights)."""
@@ -1436,6 +1443,7 @@ class Scene:
                 self.raster_z[lid] = self.z_plan[lid]
                 _place(actor, self.z_plan[lid])
         lift = self.label_radius()
+        self._show_overlays(lift)
         for lid in list(self.layers):
             model, name = split_id(lid)
             style = STYLES[name]
@@ -1466,11 +1474,16 @@ class Scene:
         """Draw the see-through layers bottom first. VTK blends
         see-through actors in the order they are in the renderer and
         does not let their heights decide (they do not write depth), so
-        the order is set to the planned heights: model rasters, then
-        line layers. Moving an actor in the list rebuilds nothing."""
-        stack = [(self.z_plan[lid], a) for lid, a in self.rasters.items()
-                 if lid in self.z_plan]
+        the order is set to the planned heights: overlay pictures, then
+        model rasters. Moving an actor in the list rebuilds nothing."""
+        stack = [(z, self.overlays[n]["meshes"][0])
+                 for n, z in self.overlay_z.items()
+                 if self.overlays[n]["meshes"]]
+        stack += [(self.z_plan[lid], a) for lid, a in self.rasters.items()
+                  if lid in self.z_plan]
         # Lines above everything coloured (they may be see-through too).
+        stack += [(self.z_top + 1, a) for o in self.overlays.values()
+                  if o["on"] and o["ov"].kind == "lines" for a in o["meshes"]]
         stack += [(self._z(lid), a) for lid, p in self.line_parts.items()
                   if self.is_on(lid) for a in p["meshes"]]
         order = [a for _, a in sorted(stack, key=lambda p: p[0])]
@@ -1543,6 +1556,85 @@ class Scene:
         for actor in self.lines[lid]:
             _set_opacity(actor, self.opacity[lid])
             actor.SetVisibility(True)
+
+    # ---- map overlays (globe_overlays.py) ----
+    def add_overlays(self, overlays):
+        """Make the user's overlays available, all off."""
+        for ov in overlays:
+            self.overlays.setdefault(ov.name, dict(
+                ov=ov, on=False, opacity=ov.opacity, labels_on=True,
+                meshes=[], labels=[], lift=None))
+
+    def set_overlay(self, name, on, render=True):
+        self.overlays[name]["on"] = bool(on)
+        self.show(render=render)
+
+    def set_overlay_labels(self, name, on, render=True):
+        o = self.overlays[name]
+        o["labels_on"] = bool(on)
+        o["lift"] = None                     # redo (or drop) the labels
+        self.show(render=render)
+
+    def set_overlay_opacity(self, name, value, render=True):
+        o = self.overlays[name]
+        o["opacity"] = float(value)
+        for actor in o["meshes"] + o["labels"]:
+            _set_opacity(actor, value)
+        if render:
+            self.pl.render()
+
+    def _show_overlays(self, lift):
+        """Pictures just above the base map, lines with the coastlines;
+        made the first time they are switched on, then shown, hidden
+        and moved."""
+        import globe_overlays as gov
+        pl = self.pl
+        for name, o in self.overlays.items():
+            ov = o["ov"]
+            if not o["on"]:
+                for actor in o["meshes"] + o["labels"]:
+                    actor.SetVisibility(False)
+                continue
+            if not o["meshes"]:
+                try:
+                    d = ov.load()
+                except (OSError, KeyError, ValueError) as exc:
+                    print("Could not load overlay", ov.path, exc)
+                    o["on"] = False
+                    continue
+                if ov.kind == "image":
+                    actor = pl.add_mesh(gov.image_mesh(d["bounds"]),
+                                        color="white", lighting=False,
+                                        zlevel=0, render=False)
+                    actor.texture = gov.texture(d["image"])
+                else:
+                    actor = pl.add_mesh(
+                        gov.line_mesh(d["points"], d["lines"]),
+                        color=ov.colour, line_width=ov.width, zlevel=0,
+                        render=False)
+                    _lines_on_top(actor)
+                    if "label_txt" in d:
+                        o["label_data"] = (d["label_pts"],
+                                           [str(t) for t in d["label_txt"]])
+                o["meshes"] = [actor]
+            z = (self.overlay_z.get(name, 2) if ov.kind == "image"
+                 else self.z_top + 1)
+            for actor in o["meshes"]:
+                _place(actor, z)
+            if o.get("label_data") and o["lift"] != lift:
+                for actor in o["labels"]:
+                    pl.remove_actor(actor, render=False)
+                o["labels"] = []
+                if o["labels_on"]:
+                    pts, txt = o["label_data"]
+                    o["labels"] = [pl.add_point_labels(
+                        _lift(pts, lift), txt, font_size=9,
+                        text_color=ov.colour, shape=None, show_points=False,
+                        always_visible=False, render=False)]
+                o["lift"] = lift
+            for actor in o["meshes"] + o["labels"]:
+                _set_opacity(actor, o["opacity"])
+                actor.SetVisibility(True)
 
     def _line_labels(self, style, labelled, lift):
         """Text of a line layer: isobar values, or H/L centres."""

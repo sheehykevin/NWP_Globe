@@ -220,9 +220,14 @@ Clear data.
 value at that place (each model's own cell), in a panel that follows
 the time steps; close the panel to remove the marker.
 
+**Map overlays** (under the model groups, when there are any): your
+own hillshade, sea mask and boundary lines, each with a tick, an
+opacity slider and (for labelled lines) an **abc** tick for names. See
+Map overlays below.
+
 **Layout**: the layers switched on, opacities, value labels, model
-order, open groups, graticule, view and play speed are kept between
-runs (`globe_settings.json`); **Reset layout** restores the defaults.
+order, open groups, map overlays, graticule, view and play speed are
+kept between runs (`globe_settings.json`); **Reset layout** restores the defaults.
 
 **Value labels**: the cells' own values (no interpolation), about 10 km
 apart, for the part of the globe in view. Zoomed out, the spacing widens
@@ -264,9 +269,47 @@ short help.
 
 For testing: `--screenshot FILE --load MODEL ...` draws off screen and
 writes a PNG (with `--valid TIME`, `--show` / `--hide` / `--labels
-MODEL:LAYER ...`, `--order`, `--steps N`); `--smoke FILE`
+MODEL:LAYER ...`, `--order`, `--steps N`, `--overlays NAME ...`);
+`--smoke FILE`
 opens the window, saves a picture of it and closes. `globe_fetch.py
 harmonie|ibi` fetches from the command line.
+
+## Map overlays
+
+A hillshade, a sea (or land) mask and boundary lines of your own can be
+drawn on the globe: pictures (hillshade, mask) on the base map under
+every model layer, lines (counties, hydrometric areas) above them with
+the coastlines. `tools/prepare_overlays.py` turns a GeoTIFF or a
+shapefile / GeoPackage in any projection into a small file in
+`data\overlays`; the globe reads those with numpy only, so neither it
+nor the standalone build needs GIS libraries. The tool needs rasterio,
+geopandas and shapely: the Anaconda base environment has them.
+
+```
+set A=C:\Python\Current_UKMO\ukmo_nwp\assets
+conda run -n base python tools\prepare_overlays.py hillshade %A%\Ireland_multidirectional_hillshade_200.tif --name hillshade_ie --label "Ireland hillshade"
+conda run -n base python tools\prepare_overlays.py lines %A%\counties.shp --name counties --label Counties --label-field COUNTYNAME --colour "#4a4a4a"
+conda run -n base python tools\prepare_overlays.py lines %A%\Hydrometric_Areas_wgs84.shp --name hydrometric_areas --label "Hydrometric areas" --label-field HYDRO_NAME --colour "#1f5fa8"
+conda run -n base python tools\prepare_overlays.py mask %A%\counties.shp %A%\ne_10m_land_ireland_removed.shp --name sea --label Sea --invert --bounds -12 -4 50.5 56.5
+```
+
+- **hillshade**: reprojected to longitude/latitude (default 0.001°,
+  about 110 m; `--res`). Flat ground (the raster's most common value)
+  leaves the base map as it is; shadows darken it and lit slopes
+  lighten it (`--strength`, `--light`), so it shades the Natural Earth
+  relief rather than covering it. No data is see-through.
+- **lines**: polygon outlines or lines, simplified (`--simplify`
+  metres) and split into short segments so they follow the globe; one
+  name per feature from `--label-field`.
+- **mask**: polygons filled with `--colour`, `--invert` for the outside
+  (sea from land polygons) within `--bounds`; several files are filled
+  together.
+
+A file whose projection GDAL reads only as a name (e.g. "IRENET95 /
+Irish Transverse Mercator") is taken as EPSG:2157; `--crs` sets any
+projection. `tools\prepare_overlays.py -h` lists every option. New
+files appear at the next start; delete a file to drop it. For the
+standalone build, copy `data\overlays` next to `NWP_Globe.exe`.
 
 ## Speed
 
@@ -292,6 +335,8 @@ top model's colours over the lower model's), not mixed together.
 | `globe_jobs.py` | Fetch jobs (window buttons, `prefetch.bat`) and the store |
 | `globe_data.py` | The store folder, latest runs, downloading Met Office files |
 | `globe_pressure.py` | High/low centres, copied from the UKMO NWP tools |
+| `globe_overlays.py` | Map overlays: reading `data\overlays` and draping them |
+| `tools/prepare_overlays.py` | Making map overlays from GeoTIFFs and shapefiles |
 | `globe_icon.py` | ICON-EU (DWD): latest run, fetching and converting files |
 | `globe_ecmwf.py` | ECMWF IFS 0.1 deg open data: latest run, fetching fields |
 | `globe_meteofrance.py` | Météo-France AROME 1.3 / 2.5 km and AROME-IFS: latest run, fetching packages |

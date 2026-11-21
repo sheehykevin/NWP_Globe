@@ -157,6 +157,7 @@ def run_window(args):
     from datetime import datetime, timezone
 
     import globe_jobs as jobs
+    import globe_overlays as overlays_mod
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     app.setStyle("Fusion")
@@ -846,6 +847,88 @@ def run_window(args):
     hint.setStyleSheet("color:#555;font-size:8pt")
     pl_lay.addWidget(hint)
     pl_lay.addWidget(groups, 1)
+
+    # ---- map overlays (data/overlays, made by tools/prepare_overlays.py)
+    overlay_rows = {}                       # name -> (tick, labels, slider)
+
+    def overlay_box():
+        box = QtWidgets.QFrame()
+        box.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        lay = QtWidgets.QVBoxLayout(box)
+        lay.setContentsMargins(4, 3, 4, 3)
+        lay.setSpacing(1)
+        head = QtWidgets.QHBoxLayout()
+        fold = QtWidgets.QToolButton()
+        fold.setAutoRaise(True)
+        title = QtWidgets.QPushButton("Map overlays")
+        title.setFlat(True)
+        title.setStyleSheet("font-weight:bold;text-align:left;padding:0")
+        title.setToolTip("Your own hillshade, masks and boundaries (files "
+                         "in data\\overlays, made with "
+                         "tools\\prepare_overlays.py)")
+        head.addWidget(fold)
+        head.addWidget(title, 1)
+        lay.addLayout(head)
+        body = QtWidgets.QWidget()
+        rows = QtWidgets.QGridLayout(body)
+        rows.setContentsMargins(24, 0, 0, 0)
+        rows.setVerticalSpacing(1)
+        for r, (name, o) in enumerate(scene.overlays.items()):
+            ov = o["ov"]
+            tick = QtWidgets.QCheckBox(ov.label)
+            tick.setChecked(o["on"])
+            tick.setToolTip({"image": "Picture under the model layers",
+                             "lines": "Lines above the model layers"}
+                            [ov.kind])
+            tick.toggled.connect(
+                lambda v, n=name: scene.set_overlay(n, v))
+            names = QtWidgets.QCheckBox("abc")
+            names.setToolTip("Names")
+            names.setChecked(o["labels_on"])
+            names.setVisible(ov.has_labels)
+            names.toggled.connect(
+                lambda v, n=name: scene.set_overlay_labels(n, v))
+            slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            slider.setRange(0, 100)
+            slider.setValue(int(round(o["opacity"] * 100)))
+            slider.setFocusPolicy(QtCore.Qt.NoFocus)
+            slider.setToolTip("Opacity")
+            slider.setMaximumWidth(60)
+            pct = QtWidgets.QLabel(f"{slider.value()}%")
+            pct.setMinimumWidth(30)
+
+            def moved(v, n=name, label=pct):
+                label.setText(f"{v}%")
+                scene.set_overlay_opacity(n, v / 100.0)
+            slider.valueChanged.connect(moved)
+            rows.addWidget(tick, r, 0)
+            rows.addWidget(names, r, 1)
+            rows.addWidget(slider, r, 2)
+            rows.addWidget(pct, r, 3)
+            rows.setColumnStretch(0, 1)
+            overlay_rows[name] = (tick, names, slider)
+        lay.addWidget(body)
+
+        def set_fold(open_):
+            body.setVisible(open_)
+            fold.setArrowType(QtCore.Qt.DownArrow if open_
+                              else QtCore.Qt.RightArrow)
+            collapsed["_overlays"] = not open_
+        set_fold(not collapsed.get("_overlays", False))
+        fold.clicked.connect(lambda: set_fold(not body.isVisible()))
+        title.clicked.connect(lambda: set_fold(not body.isVisible()))
+        return box
+
+    scene.add_overlays(overlays_mod.find())
+    for name, v in saved.get("overlays", {}).items():
+        if name in scene.overlays:
+            o = scene.overlays[name]
+            o["on"] = bool(v.get("on", False))
+            o["opacity"] = float(v.get("opacity", o["opacity"]))
+            o["labels_on"] = bool(v.get("labels", True))
+    if scene.overlays:
+        pl_lay.addWidget(overlay_box())
+        scene.show()
     note = QtWidgets.QLabel("Native model cells, no resampling. Rain "
                             "windows end at the shown time.")
     note.setStyleSheet("color:#555;font-size:8pt")
@@ -1195,7 +1278,12 @@ def run_window(args):
                                opacity=round(scene.opacity[lid], 2),
                                labels=scene.label_on[lid])
         cam = scene.pl.camera
+        overlays = {**saved.get("overlays", {}),
+                    **{n: dict(on=o["on"], opacity=round(o["opacity"], 2),
+                               labels=o["labels_on"])
+                       for n, o in scene.overlays.items()}}
         out = dict(layers=layers, order=panel_order, collapsed=collapsed,
+                   overlays=overlays,
                    model_on={**saved.get("model_on", {}),
                              **scene.model_on},
                    graticule=grid.isChecked(), speed=speed.currentIndex(),
@@ -1218,6 +1306,17 @@ def run_window(args):
             scene.label_on[lid] = False
         for m in scene.model_on:
             scene.model_on[m] = True
+        for name, (tick, names, slider) in overlay_rows.items():
+            o = scene.overlays[name]
+            o["on"], o["labels_on"], o["lift"] = False, True, None
+            for w, set_ in ((tick, lambda: tick.setChecked(False)),
+                            (names, lambda: names.setChecked(True)),
+                            (slider, lambda: slider.setValue(int(round(
+                                o["ov"].opacity * 100))))):
+                w.blockSignals(True)
+                set_()
+                w.blockSignals(False)
+            scene.set_overlay_opacity(name, o["ov"].opacity, render=False)
         panel_order[:] = list(core.MODEL_ORDER)
         collapsed.update({m: True for m in data.MODELS})
         grid.setChecked(True)
@@ -1295,6 +1394,11 @@ of its latest run (it turns into a stop button while fetching); a
 layer's button fetches that layer for every hour. The <b>Models</b> and
 <b>Parameters</b> menus with <b>Fetch</b> fetch several at once. Fetches
 can keep running after the window closes.</p>
+<p><b>Map overlays</b> (under the models, when there are any): your own
+hillshade, sea mask and boundary lines from <code>data\\overlays</code>,
+made with <code>tools\\prepare_overlays.py</code> (see the README).
+Pictures sit under the model layers, lines above them; <b>abc</b> shows
+names.</p>
 <p><b>Time bar</b>: the strip under the slider is green where every
 layer switched on is ready.</p>
 <p>Downloads are kept in <code>data\\store</code> until a newer run
@@ -1349,6 +1453,14 @@ def run_screenshot(args):
     import geovista as gv
     pl = gv.GeoPlotter(off_screen=True, window_size=(1400, 1000))
     scene = core.Scene(pl, area=args.area, base=args.base, view=args.view)
+    import globe_overlays
+    scene.add_overlays(globe_overlays.find())
+    for name in args.overlays:
+        if name not in scene.overlays:
+            raise SystemExit(f"No overlay {name!r} in "
+                             f"{globe_overlays.OVERLAY_DIR}: "
+                             + ", ".join(scene.overlays))
+        scene.overlays[name]["on"] = True
     for model in args.load:
         scene.add_model(core.load_model(model, area=args.area))
     for lid in args.show:
@@ -1395,6 +1507,9 @@ def main():
     ap.add_argument("--order", nargs="+", choices=list(data.MODELS),
                     help="with --screenshot: models to draw on top, top "
                     "first (the rest follow)")
+    ap.add_argument("--overlays", nargs="*", default=[], metavar="NAME",
+                    help="with --screenshot: map overlays on (names of "
+                    "files in data/overlays)")
     ap.add_argument("--steps", type=int, default=0,
                     help="with --screenshot: time steps to move first")
     ap.add_argument("--smoke", help="testing: open the window, save a "
