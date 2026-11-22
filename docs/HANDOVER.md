@@ -19,7 +19,11 @@ in [REVIEW.md](REVIEW.md) (items D1–D5); how to use it is in the
   `sea.npz`, from `C:\Python\Current_UKMO\ukmo_nwp\assets` with the
   commands in the README.
 - `globe_settings.json` was used for a test and put back byte for byte.
-- `dist\NWP_Globe` was **not** rebuilt.
+- `dist\NWP_Globe` rebuilt from `2b29c37` (21 Nov, 22:1x): all six
+  `build.bat` steps passed, 1.40 GB; `data\overlays` copied next to the
+  exe, and the exe draws them (`--screenshot ... --overlays`).
+- The store's UKV run is now 21 Nov 18Z, fetched with the new download
+  code (see Checked).
 
 ## What changed, in short
 
@@ -53,26 +57,28 @@ Also: `GLOBE_PROFILE=1` (redraw timings); F1 help mentions overlays;
 - Real window (`--smoke`) with overlays switched on in the settings:
   panel section appears, saved state restored and written back.
 - `globe.py --screenshot ... --overlays hillshade_ie counties` works.
+- Real fetch job, `globe.py --job ukv --latest`: the whole 21 Nov 18Z
+  run (660 layer-hours) in 49 s, no errors; 384 files (392 MB), no
+  `.part` files left, 625 prepared items (the rest are rain windows that
+  cannot exist yet, e.g. 24-hour rain before T+24); the older run was
+  dropped and logged; the new run loads.
+- `build.bat`: passed, including its smoke test of both programs; the
+  built exe draws the overlays.
 
 ## Not checked
 
-- **`build.bat`**: the standalone build was not rebuilt or smoke-tested.
-  `globe_overlays` is in the hidden imports and `vtkRenderStepsPass` comes
-  from `vtkmodules.vtkRenderingOpenGL2`, which pyvista already needs, but
-  run the build to be sure (also that its size has not grown).
 - **Clicking through the window by hand**: toggles, opacity sliders,
   **abc** ticks, Reset layout and dragging models were exercised through
   the `Scene` API and the smoke test, not by hand.
-- **Fetch jobs end to end** with the new download code (only
-  `Files._download` was tested directly).
 - Another computer's graphics card (texture size of the hillshade,
   render pass).
 
 ## Known points and loose ends
 
-- **Sea colour**: the default `#9cc3e0` is close to the lightest rain
-  band (`#BFEFFF`). Pick a greyer colour or lower opacity (`--colour`,
-  the panel slider) if it confuses.
+- **Sea mask look**: the default `#9cc3e0` is close to the lightest rain
+  band (`#BFEFFF`), and the mask stops at its `--bounds` box, which
+  shows as a hard-edged rectangle when zoomed out. Pick a greyer colour,
+  lower opacity or wider bounds if either bothers you.
 - **First step to a new time** can take ~0.6 s once (first raster actor
   made); afterwards ~120 ms from disk, ~10 ms from memory.
 - **`RAIN_KEEP` = 240 fields**: with several models' run-total rain on,
@@ -94,8 +100,7 @@ Also: `GLOBE_PROFILE=1` (redraw timings); F1 help mentions overlays;
 ## Next steps
 
 1. Look at it in the window; push when happy.
-2. Run `build.bat`; copy `data\overlays` next to `NWP_Globe.exe` and
-   check the overlays there.
-3. Decide the sea colour; regenerate `sea.npz` if changed.
-4. Carry on with C1–C7 in [REVIEW.md](REVIEW.md); C7 (tests) could start
+2. Decide the sea mask's colour and bounds; regenerate `sea.npz` (and
+   copy it to `dist\NWP_Globe\data\overlays`) if changed.
+3. Carry on with C1–C7 in [REVIEW.md](REVIEW.md); C7 (tests) could start
    from the checks listed above.
