@@ -76,8 +76,8 @@ def image_mesh(bounds):
     import geovista as gv
     from geovista.common import from_cartesian
     w, e, s, n = (float(v) for v in bounds)
-    nx = int(np.clip(np.ceil((e - w) / IMAGE_STEP), 2, 2000))
-    ny = int(np.clip(np.ceil((n - s) / IMAGE_STEP), 2, 2000))
+    nx = int(np.clip(np.ceil((e - w) / IMAGE_STEP), 2, 400))
+    ny = int(np.clip(np.ceil((n - s) / IMAGE_STEP), 2, 400))
     mesh = gv.Transform.from_1d(np.linspace(w, e, nx + 1),
                                 np.linspace(s, n, ny + 1))
     lonlat = from_cartesian(mesh)

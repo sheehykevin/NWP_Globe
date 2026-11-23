@@ -290,7 +290,7 @@ set A=C:\Python\Current_UKMO\ukmo_nwp\assets
 conda run -n base python tools\prepare_overlays.py hillshade %A%\Ireland_multidirectional_hillshade_200.tif --name hillshade_ie --label "Ireland hillshade"
 conda run -n base python tools\prepare_overlays.py lines %A%\counties.shp --name counties --label Counties --label-field COUNTYNAME --colour "#4a4a4a"
 conda run -n base python tools\prepare_overlays.py lines %A%\Hydrometric_Areas_wgs84.shp --name hydrometric_areas --label "Hydrometric areas" --label-field HYDRO_NAME --colour "#1f5fa8"
-conda run -n base python tools\prepare_overlays.py mask %A%\counties.shp %A%\ne_10m_land_ireland_removed.shp --name sea --label Sea --invert --bounds -12 -4 50.5 56.5
+conda run -n base python tools\prepare_overlays.py mask %A%\counties.shp %A%\ne_10m_land_ireland_removed.shp --name sea --label Sea --invert --bounds -80 50 15 80 --res 0.02
 ```
 
 - **hillshade**: reprojected to longitude/latitude (default 0.001°,
@@ -303,7 +303,9 @@ conda run -n base python tools\prepare_overlays.py mask %A%\counties.shp %A%\ne_
   name per feature from `--label-field`.
 - **mask**: polygons filled with `--colour`, `--invert` for the outside
   (sea from land polygons) within `--bounds`; several files are filled
-  together.
+  together. The sea above covers the global models' area (80°W-50°E,
+  15-80°N); a box that big needs a coarser `--res` (0.02°, about 2 km)
+  to keep the picture a size any graphics card can hold.
 
 A file whose projection GDAL reads only as a name (e.g. "IRENET95 /
 Irish Transverse Mercator") is taken as EPSG:2157; `--crs` sets any

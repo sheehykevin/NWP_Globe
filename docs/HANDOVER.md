@@ -7,17 +7,19 @@ in [REVIEW.md](REVIEW.md) (items D1–D5); how to use it is in the
 
 ## State
 
-- Branch `main`, two commits on top of `479af96`, not pushed:
-  `f1f68d3` speed work and the layer-order fix (D1–D4), then the map
-  overlays commit (D5, with this file). The first commit was checked on
-  its own (pyflakes, timings, window smoke test).
+- Branch `main`, pushed to GitHub: `f1f68d3` speed work and the
+  layer-order fix (D1–D4), `2b29c37` map overlays (D5, with this file),
+  `419ea9c` this file's update, then the sea mask change (23 Nov). The
+  first commit was checked on its own (pyflakes, timings, window smoke
+  test).
 - Changed: `globe_core.py`, `globe.py`, `globe_data.py`, `README.md`,
   `docs/REVIEW.md`, `packaging/NWP_Globe.spec`.
 - New: `globe_overlays.py`, `tools/prepare_overlays.py`, this file.
 - Made, not in git (`data/` is ignored): `data/overlays/` with
   `hillshade_ie.npz` (7.8 MB), `counties.npz`, `hydrometric_areas.npz`,
   `sea.npz`, from `C:\Python\Current_UKMO\ukmo_nwp\assets` with the
-  commands in the README.
+  commands in the README. **Not in git**: on a new machine copy
+  `data\overlays` across by hand (or remake it with the prep tool).
 - `globe_settings.json` was used for a test and put back byte for byte.
 - `dist\NWP_Globe` rebuilt from `2b29c37` (21 Nov, 22:1x): all six
   `build.bat` steps passed, 1.40 GB; `data\overlays` copied next to the
@@ -65,20 +67,24 @@ Also: `GLOBE_PROFILE=1` (redraw timings); F1 help mentions overlays;
 - `build.bat`: passed, including its smoke test of both programs; the
   built exe draws the overlays.
 
+- By hand in the window (user, 23 Nov): overlays, sliders, ticks.
+- Another computer (user, 23 Nov): laptop with an Intel Core 135U and
+  integrated graphics works, though less smoothly than the desktop. If
+  the hillshade weighs on it, remake that with `--res 0.002`.
+
 ## Not checked
 
-- **Clicking through the window by hand**: toggles, opacity sliders,
-  **abc** ticks, Reset layout and dragging models were exercised through
-  the `Scene` API and the smoke test, not by hand.
-- Another computer's graphics card (texture size of the hillshade,
-  render pass).
+- Nothing outstanding from this work.
 
 ## Known points and loose ends
 
-- **Sea mask look**: the default `#9cc3e0` is close to the lightest rain
-  band (`#BFEFFF`), and the mask stops at its `--bounds` box, which
-  shows as a hard-edged rectangle when zoomed out. Pick a greyer colour,
-  lower opacity or wider bounds if either bothers you.
+- **Sea mask**: remade on 23 Nov over the global models' area
+  (`--bounds -80 50 15 80 --res 0.02`, 4392×3250 pixels), so its edge
+  is the global models' edge, not a box round Ireland. Overlay pictures'
+  surfaces are now capped at 400×400 cells (`globe_overlays.image_mesh`;
+  this box would have been about 2.6M points, now 161k, made in 0.35 s).
+  The colour `#9cc3e0` is still close to the lightest rain band
+  (`#BFEFFF`).
 - **First step to a new time** can take ~0.6 s once (first raster actor
   made); afterwards ~120 ms from disk, ~10 ms from memory.
 - **`RAIN_KEEP` = 240 fields**: with several models' run-total rain on,
@@ -99,8 +105,7 @@ Also: `GLOBE_PROFILE=1` (redraw timings); F1 help mentions overlays;
 
 ## Next steps
 
-1. Look at it in the window; push when happy.
-2. Decide the sea mask's colour and bounds; regenerate `sea.npz` (and
-   copy it to `dist\NWP_Globe\data\overlays`) if changed.
-3. Carry on with C1–C7 in [REVIEW.md](REVIEW.md); C7 (tests) could start
+1. Rebuild the exe (`build.bat`) to carry the mesh cap; the new
+   `sea.npz` is already copied next to it.
+2. Carry on with C1–C7 in [REVIEW.md](REVIEW.md); C7 (tests) could start
    from the checks listed above.
